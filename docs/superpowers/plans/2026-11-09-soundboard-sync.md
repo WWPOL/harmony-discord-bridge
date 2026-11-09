@@ -12,7 +12,7 @@
 
 ## Repos and branches
 
-- **Harmony:** worktree of `C:\Users\Rudhra\Code\brapmony` on new branch `feat/bridge-soundboard-sync` from `master` (7615d48d). Tasks H1–H3. Read `docs/contribute/migrations.md` there before H1.
+- **Harmony:** worktree of `C:\Users\Rudhra\Code\brapmony` on new branch `feat/bridge-soundboard-sync` from `master` (7615d48d), at `C:SERSRUDHRACODEWORKTREESBRAPMONY-SOUNDBOARD-SYNC`. Tasks H1–H3. Read `docs/contribute/migrations.md` there before H1.
 - **Bridge:** this worktree (`harmony-discord-bridge`, branch `worktree-cuddly-swinging-heron`). Tasks B1–B3. B1 has no Harmony dependency; B2/B3 code against the H3 HTTP contract below.
 
 ## Global Constraints
@@ -58,8 +58,8 @@ HarmonyServerSound = { id: string, name: string, emoji: string|null, emoji_id: s
 ### Task H1: Harmony migration + pgTAP
 
 **Files:**
-- Create: `db_schema/migrations/20261109100001_bridge_server_sounds.sql`
-- Create: `db_schema/tests/246_bridge_server_sounds.sql`
+- Create: `db_schema/migrations/20261109200001_bridge_server_sounds.sql`
+- Create: `db_schema/tests/250_bridge_server_sounds.sql`
 - Modify: `db_schema/SURFACE.tsv`, `db_schema/REACHABILITY.tsv` (rows for the two RPCs, same format as the `bridge_import_server_emoji` rows; sorted position as the generator would place them). Docker is not available locally: hand-write the rows; CI's `surface`/`reachability` jobs verify. Say so in the PR body.
 
 **Interfaces — Produces:**
@@ -77,7 +77,7 @@ Import RPC logic, in order:
 
 Delete RPC: bridge-bot check, `DELETE … WHERE id = p_sound_id AND server_id = p_server_id RETURNING storage_path`.
 
-- [ ] **Step 1: Write `246_bridge_server_sounds.sql`** modeled on `97_bridge_server_emojis.sql` (fixture server `55555555-0000-0000-0000-000000000005`, bots `b1` bridge / `b2` not). Assertions:
+- [ ] **Step 1: Write `250_bridge_server_sounds.sql`** modeled on `97_bridge_server_emojis.sql` (fixture server `55555555-0000-0000-0000-000000000005`, bots `b1` bridge / `b2` not). Assertions:
   - authenticated and anon lack EXECUTE on both functions;
   - b2 calling import → `throws_ok … '42501'`; b2 delete → 42501;
   - import with no path for a new id → throws 22023 `invalid sound file`;
