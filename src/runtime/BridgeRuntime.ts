@@ -397,6 +397,12 @@ export class BridgeRuntime {
       Math.max(PRESENCE_MIN_INTERVAL_MS, opts.presenceFlushMs ?? PRESENCE_MIN_INTERVAL_MS),
     )
     this.media = new OutboundMedia(this.harmonyBaseUrl.href, opts.media ?? mediaOptionsFromEnv(process.env, this.log), opts.fetchImpl)
+    this.importTestAuthors = new Set(
+      (process.env.BRIDGE_IMPORT_TEST_AUTHORS ?? '').split(',').map(s => s.trim()).filter(Boolean),
+    )
+    if (this.importTestAuthors.size > 0) {
+      this.log.warn(`BRIDGE_IMPORT_TEST_AUTHORS is set: history import treats ${this.importTestAuthors.size} bot/webhook author(s) as people. Testing only.`)
+    }
     this.appEmojiDir = opts.appEmojiDir ?? null
 
     this.shared = opts.sharedDiscord ?? null
@@ -1909,6 +1915,13 @@ export class BridgeRuntime {
   private readonly absentMembers = new Map<string, number>()
 
   /**
+   * BRIDGE_IMPORT_TEST_AUTHORS: bot or webhook ids whose messages history import treats as a
+   * person's, so a test server seeded through a webhook can be imported. Testing only; live
+   * relay ignores it. Empty by default.
+   */
+  private readonly importTestAuthors: Set<string>
+
+  /**
    * Guild member of a message's author: carries the server nickname. Null once they have left.
    * `rememberAbsent` (history import) skips the REST lookup for an hour after a miss, so a departed
    * author's hundreds of messages do not each cost a 404 on the shared REST queue.
@@ -1936,7 +1949,7 @@ export class BridgeRuntime {
    * anti-spam. Null for bots, message types other than Default/Reply, and empty translations.
    */
   async translateForImport(msg: DiscordMessage): Promise<Omit<ImportMessage, 'thread_id' | 'pinned'> | null> {
-    if (msg.author.bot) return null
+    if (msg.author.bot && !this.importTestAuthors.has(msg.author.id)) return null
     if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) return null
 
     const guildMember = await this.guildMemberFor(msg, true)

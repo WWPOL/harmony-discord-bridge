@@ -174,6 +174,7 @@ All settings are environment variables (`-e NAME=value`).
 | `BRIDGE_IMPORT_POLL_MS` | no | How often the bridge looks for history import jobs, in milliseconds. Default `10000`, minimum `1000`. |
 | `BRIDGE_IMPORT_PAGE_DELAY_MS` | no | Pause between pages of Discord history while importing, to stay gentle on Discord's rate limits. Default `1000`, `0` for none. |
 | `BRIDGE_IMPORT_CONCURRENCY` | no | How many imports run at once in this process. Default `1`. |
+| `BRIDGE_IMPORT_TEST_AUTHORS` | no | Testing only. Comma-separated bot or webhook ids whose messages the history import treats as a person's, so a test server seeded through a webhook can be imported. Leave unset in production. |
 
 Which channels are paired and what is synced (member list, presence,
 reactions, edits, deletions) is set in Harmony's Discord Bridge page; the
