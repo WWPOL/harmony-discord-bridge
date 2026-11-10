@@ -992,7 +992,10 @@ async function runBridgeImportHistory(rt: BridgeRuntime, command: ChatInputComma
   for (const j of latest.values()) {
     const pct = importPercent(j)
     const cancelling = j.cancel_requested && ACTIVE_IMPORT_STATES.has(j.state)
-    const parts = [cancelling ? 'cancelling' : j.state, pct === null ? '-' : `${pct}%`, `${j.imported_count} messages`]
+    // A finished run counts what that run added: a re-run over an imported channel adds nothing.
+    const count = j.state !== 'done' ? `${j.imported_count} messages`
+      : j.imported_count > 0 ? `${j.imported_count} new messages` : 'up to date'
+    const parts = [cancelling ? 'cancelling' : j.state, pct === null ? '-' : `${pct}%`, count]
     lines.push(`• ${harmonyChannelName(rt, j.harmony_channel_id)}: ${parts.join(', ')}${j.error ? ` (${importErrorText(j.error)})` : ''}`)
   }
   await command.editReply({ content: joinLinesWithinDiscordLimit(lines) })
