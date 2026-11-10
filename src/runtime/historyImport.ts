@@ -1,19 +1,59 @@
 import type { Message as DiscordMessage } from 'discord.js'
 import { BridgeApiError, type BridgeApi, type ImportJob, type ImportMessage } from '../v2/BridgeApi.js'
 import { errorText, type Logger } from '../log.js'
+import type { Problem } from '../problems.js'
+import { threadName } from './threadSync.js'
 
 export type ImportResult = 'done' | 'cancelled' | 'failed' | 'paused'
 
+/** The parts of a Discord thread the importer reads. */
+export interface ImportThreadLike {
+  id: string
+  name: string | null
+  ownerId: string | null
+  createdAt: Date | null
+  archived: boolean | null
+  locked: boolean | null
+}
+
+export interface ThreadListPage {
+  threads: ImportThreadLike[]
+  /** Opaque cursor for the next page; null when the listing is complete. */
+  next: Record<string, unknown> | null
+}
+
 export interface HistoryImporterDeps {
   api: Pick<BridgeApi, 'updateImport' | 'postImportMessages' | 'importThread' | 'linkImportReplies' | 'listImports'>
-  /** One page of a channel's history, newest first, at most 100; `before` is exclusive. */
+  /** One page of a channel's (or thread's) history, newest first, at most 100; `before` is exclusive. */
   fetchPage(channelId: string, before: string | undefined): Promise<DiscordMessage[]>
   /** Ids of the channel's pinned messages. */
   fetchPins(channelId: string): Promise<Set<string>>
   translate(msg: DiscordMessage): Promise<Omit<ImportMessage, 'thread_id' | 'pinned'> | null>
+  /**
+   * Threads of a channel: active ones (guild-wide list filtered to the channel), then archived
+   * public, then archived private (skipped without Manage Threads). The cursor is opaque to the
+   * importer and records which list it is in and the `before` timestamp; null starts from the top.
+   */
+  listThreads(channelId: string, cursor: Record<string, unknown> | null): Promise<ThreadListPage>
+  /** Whether the bot may list private threads of the channel (Manage Threads). */
+  canReadPrivateThreads(channelId: string): boolean
+  /** Whether the thread was started from a message of the channel, i.e. a message with the thread's id exists. */
+  hasStarterMessage(channelId: string, threadId: string): Promise<boolean>
+  /** The Harmony discord_user of the member who started the thread, or null. */
+  threadStarter(thread: ImportThreadLike): Promise<Record<string, unknown> | null>
+  /** Raises a problem (shown in /bridge status and reported to Harmony). */
+  reportProblem(problem: Problem): void
   pageDelayMs: number
   sleep?: (ms: number) => Promise<void>
   log: Logger
+}
+
+/** Progress inside the threads phase, stored as the job's `thread_cursor`. */
+interface ThreadProgress {
+  /** The listThreads cursor of the page being worked through; null is the first page. */
+  at: Record<string, unknown> | null
+  /** Threads of that page already imported. */
+  done: number
 }
 
 const DISCORD_EPOCH_MS = 1420070400000n
@@ -21,6 +61,7 @@ const DISCORD_EPOCH_MS = 1420070400000n
 const ACCESS_LOST_CODES = new Set([50001, 50013, 10003])
 /** Backoff before each retry of a transient failure; the call is made once more after each wait. */
 const RETRY_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000]
+const NO_PINS: ReadonlySet<string> = new Set()
 
 /** Unwinds run() with its result. */
 class Stop extends Error {
@@ -46,14 +87,32 @@ export class HistoryImporter {
   }
 
   /**
-   * Runs one job to the end of its messages phase. Resumable: progress is read from the job's
-   * `reached_discord_message_id`. Returns 'paused' when the scheduler should pick the job up again
-   * later (abort, or retries exhausted), 'failed' when the job is over, 'cancelled' on request.
+   * Runs one job through its messages, threads and replies phases, starting at the job's phase.
+   * Resumable: progress is read from `reached_discord_message_id` (messages) and `thread_cursor`
+   * (threads). Returns 'paused' when the scheduler should pick the job up again later (abort, or
+   * retries exhausted or the server paused it), 'failed' when the job is over, 'cancelled' on
+   * request, 'done' when the job finished (the PATCH to state done has been made).
    */
   async run(job: ImportJob, signal: AbortSignal): Promise<ImportResult> {
     const state = { ...job }
     try {
-      return await this.messagesPhase(state, signal)
+      // Always: a no-op for a job left 'running' by a crash, a transition for queued/paused.
+      await this.patch(state, { state: 'running' })
+      if (state.cancel_requested) await this.cancel(state)
+
+      if (state.phase === 'messages') {
+        await this.messagesPhase(state, signal)
+        await this.patch(state, { phase: 'threads' })
+        state.phase = 'threads'
+      }
+      if (state.phase === 'threads') {
+        await this.threadsPhase(state, signal)
+        await this.patch(state, { phase: 'replies' })
+        state.phase = 'replies'
+      }
+      await this.harmonyCall(state, signal, () => this.deps.api.linkImportReplies(state.id))
+      await this.patch(state, { state: 'done' }, signal)
+      return 'done'
     } catch (error) {
       if (error instanceof Stop) return error.result
       this.deps.log.error(`History import ${job.id} crashed: ${errorText(error)}`)
@@ -62,31 +121,89 @@ export class HistoryImporter {
     }
   }
 
-  private async messagesPhase(job: ImportJob, signal: AbortSignal): Promise<ImportResult> {
-    const { api, log } = this.deps
+  private async messagesPhase(job: ImportJob, signal: AbortSignal): Promise<void> {
+    const pins = await this.discordCall(job, signal, () => this.deps.fetchPins(job.discord_channel_id))
+    await this.importPages(job, signal, { discordId: job.discord_channel_id, harmonyThreadId: null, pins })
+  }
+
+  private async threadsPhase(job: ImportJob, signal: AbortSignal): Promise<void> {
+    const { log } = this.deps
     const channelId = job.discord_channel_id
+    const saved = job.thread_cursor as Partial<ThreadProgress> | null
+    let at = saved?.at ?? null
+    let skip = saved?.done ?? 0
+    let threadsDone = job.threads_done
+    // Only a run that starts from the very top knows the full count.
+    let fresh = !saved && threadsDone === 0
 
-    // Always: a no-op for a job left 'running' by a crash, a transition for queued/paused.
-    await this.patch(job, { state: 'running' })
-    if (job.cancel_requested) return this.cancel(job)
+    if (!this.deps.canReadPrivateThreads(channelId)) {
+      log.warn(`History import ${job.id}: the bot cannot read private threads of ${channelId}; they are skipped`)
+      this.deps.reportProblem({ code: 'private_threads_skipped', params: { discord_channel_id: channelId } })
+    }
 
-    const pins = await this.discordCall(job, signal, () => this.deps.fetchPins(channelId))
-
-    let before = job.reached_discord_message_id ?? undefined
     for (;;) {
-      if (signal.aborted) return this.pause(job)
+      if (signal.aborted) return this.stop(await this.pause(job))
+      const { threads, next } = await this.discordCall(job, signal, () => this.deps.listThreads(channelId, at))
+      if (fresh && next === null) await this.patch(job, { threads_total: threads.length })
+      fresh = false
 
-      const raw = await this.discordCall(job, signal, () => this.deps.fetchPage(channelId, before))
-      if (raw.length === 0) break
+      for (let i = skip; i < threads.length; i++) {
+        await this.importThread(job, signal, threads[i])
+        threadsDone++
+        const progress: ThreadProgress = i === threads.length - 1 && next ? { at: next, done: 0 } : { at, done: i + 1 }
+        await this.patch(job, { threads_done: threadsDone, thread_cursor: { ...progress } }, signal)
+      }
+      if (!next) return
+      at = next
+      skip = 0
+    }
+  }
+
+  private async importThread(job: ImportJob, signal: AbortSignal, thread: ImportThreadLike): Promise<void> {
+    const channelId = job.discord_channel_id
+    const hasStarter = await this.discordCall(job, signal, () => this.deps.hasStarterMessage(channelId, thread.id))
+    const discordUser = await this.deps.threadStarter(thread).catch(() => null) ?? null
+    const harmonyThreadId = await this.harmonyCall(job, signal, () => this.deps.api.importThread(job.id, {
+      discord_thread_id: thread.id,
+      name: threadName(thread.name),
+      created_at: (thread.createdAt ?? snowflakeTime(thread.id)).toISOString(),
+      starter_discord_message_id: hasStarter ? thread.id : null,
+      discord_user: discordUser,
+      archived: thread.archived ?? false,
+      locked: thread.locked ?? false,
+    }))
+    // Each thread restarts from its newest message; the server dedupes, so a repeat is safe.
+    await this.importPages(job, signal, { discordId: thread.id, harmonyThreadId, pins: NO_PINS })
+  }
+
+  /**
+   * Pages through a channel's (thread's) history, newest first, posting batches. For the channel
+   * itself (no harmonyThreadId) the job's start and reached markers are kept; threads restart
+   * from the newest message every time.
+   */
+  private async importPages(
+    job: ImportJob,
+    signal: AbortSignal,
+    scope: { discordId: string; harmonyThreadId: string | null; pins: ReadonlySet<string> },
+  ): Promise<void> {
+    const { api, log } = this.deps
+    const isChannel = scope.harmonyThreadId === null
+    let before = isChannel ? job.reached_discord_message_id ?? undefined : undefined
+
+    for (;;) {
+      if (signal.aborted) return this.stop(await this.pause(job))
+
+      const raw = await this.discordCall(job, signal, () => this.deps.fetchPage(scope.discordId, before))
+      if (raw.length === 0) return
       // Newest first, whatever order the fetcher produced.
       const page = [...raw].sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : BigInt(a.id) > BigInt(b.id) ? -1 : 0))
 
-      if (!job.start_discord_message_id) {
+      if (isChannel && !job.start_discord_message_id) {
         const newest = page[0]
         const patch = {
           start_discord_message_id: newest.id,
           start_at: newest.createdAt.toISOString(),
-          channel_created_at: snowflakeTime(channelId).toISOString(),
+          channel_created_at: snowflakeTime(job.discord_channel_id).toISOString(),
         }
         await this.patch(job, patch)
         Object.assign(job, patch)
@@ -101,7 +218,12 @@ export class HistoryImporter {
           log.warn(`History import ${job.id}: skipping Discord message ${msg.id}, translation failed: ${errorText(error)}`)
           continue
         }
-        if (translated) batch.push({ ...translated, pinned: pins.has(msg.id) })
+        if (!translated) continue
+        batch.push({
+          ...translated,
+          pinned: scope.pins.has(msg.id),
+          ...(scope.harmonyThreadId ? { thread_id: scope.harmonyThreadId } : {}),
+        })
       }
       if (batch.length > 0) {
         // `skipped` mixes empty and already-present ids; it says nothing about progress.
@@ -109,29 +231,38 @@ export class HistoryImporter {
       }
 
       const oldest = page[page.length - 1]
-      const reached = { reached_discord_message_id: oldest.id, reached_at: oldest.createdAt.toISOString() }
-      await this.patch(job, reached, signal)
-      Object.assign(job, reached)
+      if (isChannel) {
+        const reached = { reached_discord_message_id: oldest.id, reached_at: oldest.createdAt.toISOString() }
+        await this.patch(job, reached, signal)
+        Object.assign(job, reached)
+      }
       before = oldest.id
 
-      if (signal.aborted) return this.pause(job)
+      if (signal.aborted) return this.stop(await this.pause(job))
       await this.sleep(this.deps.pageDelayMs)
-      if (signal.aborted) return this.pause(job)
+      if (signal.aborted) return this.stop(await this.pause(job))
 
-      const latest = (await this.harmonyCall(job, signal, () => api.listImports())).find(j => j.id === job.id)
-      if (!latest || latest.cancel_requested) return this.cancel(job)
+      await this.checkServerState(job, signal)
     }
-
-    // B3 replaces this hand-off: after the messages phase it runs the threads and replies phases
-    // within this same run(), and only then finishes the job. Until then the messages phase ends
-    // with the phase switched to 'threads' and reports 'done'.
-    await this.patch(job, { phase: 'threads' })
-    return 'done'
   }
 
-  private async cancel(job: ImportJob): Promise<ImportResult> {
+  /** Re-reads the job from the server: an operator may have cancelled or paused it, or it may be gone. */
+  private async checkServerState(job: ImportJob, signal: AbortSignal): Promise<void> {
+    const latest = (await this.harmonyCall(job, signal, () => this.deps.api.listImports())).find(j => j.id === job.id)
+    if (!latest || latest.state === 'failed') throw new Stop('failed')
+    if (latest.state === 'paused') throw new Stop('paused')
+    if (latest.state === 'cancelled') throw new Stop('cancelled')
+    if (latest.cancel_requested) await this.cancel(job)
+  }
+
+  private stop(result: ImportResult): never {
+    throw new Stop(result)
+  }
+
+  /** PATCHes cancelled, then unwinds run() with 'cancelled'. */
+  private async cancel(job: ImportJob): Promise<never> {
     await this.bestEffortPatch(job.id, { state: 'cancelled' })
-    return 'cancelled'
+    throw new Stop('cancelled')
   }
 
   private async pause(job: ImportJob): Promise<ImportResult> {
