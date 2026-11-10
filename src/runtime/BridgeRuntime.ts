@@ -65,6 +65,7 @@ import { ServerEmojiLinks } from './serverEmojiLinks.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
 import type { FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
+import type { ImportMessage } from '../v2/BridgeApi.js'
 import type { DiscordGuildView, PrivilegedIntent, Problem } from '../problems.js'
 import { collectGuildViews } from '../v2/selfCheck.js'
 import type { PairDirectory, PairWriter } from './PairDirectory.js'
@@ -1890,6 +1891,39 @@ export class BridgeRuntime {
     }
   }
 
+  /** Guild member of a message's author: carries the server nickname. Null once they have left. */
+  private async guildMemberFor(msg: DiscordMessage) {
+    let guildMember = msg.member
+    if (!guildMember && msg.guild) {
+      guildMember = msg.guild.members.cache.get(msg.author.id)
+        ?? await msg.guild.members.fetch(msg.author.id).catch(() => null)
+    }
+    return guildMember
+  }
+
+  /**
+   * A Discord message as a history-import row: the same parts and `discord_user` as live relay,
+   * without relay's reply resolution (the server links replies by Discord id), thread lookup or
+   * anti-spam. Null for bots, message types other than Default/Reply, and empty translations.
+   */
+  async translateForImport(msg: DiscordMessage): Promise<Omit<ImportMessage, 'thread_id' | 'pinned'> | null> {
+    if (msg.author.bot) return null
+    if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) return null
+
+    const guildMember = await this.guildMemberFor(msg)
+    const content = this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(await this.emojiServerFor(msg.guildId)), { content: msg.content ?? '' })
+    if (content.length === 0) return null
+
+    return {
+      discord_message_id: msg.id,
+      created_at: msg.createdAt.toISOString(),
+      edited_at: msg.editedAt?.toISOString() ?? null,
+      content,
+      discord_user: buildDiscordUserMetadata(msg.author, guildMember, this.discordMemberDetails.get(msg.author.id)).discord_user as Record<string, unknown>,
+      reply_to_discord_message_id: msg.reference?.messageId ?? null,
+    }
+  }
+
   private async onDiscordMessage(msg: DiscordMessage) {
     if (msg.author.bot) return
 
@@ -1927,12 +1961,7 @@ export class BridgeRuntime {
     try {
       const { replyTo, cleanedContent } = await this.resolveDiscordReplyToHarmony(msg, harmonyChannelId)
 
-      // Guild member carries the server nickname.
-      let guildMember = msg.member
-      if (!guildMember && msg.guild) {
-        guildMember = msg.guild.members.cache.get(msg.author.id)
-          ?? await msg.guild.members.fetch(msg.author.id).catch(() => null)
-      }
+      const guildMember = await this.guildMemberFor(msg)
 
       // Attachment storage policy (link/refresh/mirror) is applied by the bot-gateway.
       const contentParts = this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(await this.emojiServerFor(msg.guildId)), { content: cleanedContent })
