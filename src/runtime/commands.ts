@@ -23,8 +23,11 @@ import {
 import { describeProblem } from '../problems.js'
 import { DiscordAuthorLimiter } from './antiSpam.js'
 import { memberJoinedAt } from '../utils/discordUserMetadata.js'
-import { isAutomodBlocked } from '../HarmonyClient.js'
+import { isAutomodBlocked, HarmonyHttpError } from '../HarmonyClient.js'
 import { errorText } from '../log.js'
+import { confirmAction } from './confirmPrompt.js'
+import { planSync, syncReportLines, SYNC_MODE_CHOICES, type SyncMode } from './expressionSync.js'
+import { desiredSound, harmonySyncItem, soundDiffers, type DesiredSound } from './soundSync.js'
 
 // =============================================================================
 // Command definitions
@@ -118,6 +121,17 @@ export function buildCommands(mode: 'v1' | 'v2') {
         .setDescription('Copy this server\'s custom emojis into the Harmony server (rerun adds only new ones)')
         .addBooleanOption(opt =>
           opt.setName('dry_run').setDescription('List what would be imported without changes').setRequired(false)))
+    bridgeCommand.addSubcommand(sub =>
+      sub
+        .setName('sync-sounds')
+        .setDescription('Make the Harmony soundboard match this server\'s (rerun applies changes)')
+        .addStringOption(opt =>
+          opt.setName('mode')
+            .setDescription('How to reconcile (default: mirror)')
+            .setRequired(false)
+            .addChoices(...SYNC_MODE_CHOICES))
+        .addBooleanOption(opt =>
+          opt.setName('dry_run').setDescription('Show what would change without making changes').setRequired(false)))
   }
 
   return [
@@ -384,6 +398,9 @@ async function handleBridgeCommand(rt: BridgeRuntime, command: ChatInputCommandI
         break
       case 'import-emojis':
         await runBridgeImportEmojis(rt, command)
+        break
+      case 'sync-sounds':
+        await runBridgeSyncSounds(rt, command)
         break
       default:
         await command.reply({ content: `❌ Unknown subcommand: ${sub}`, flags: MessageFlags.Ephemeral })
@@ -957,4 +974,141 @@ async function runBridgeImportEmojis(rt: BridgeRuntime, command: ChatInputComman
     if (failures.length > 15) lines.push(`  • …and ${failures.length - 15} more`)
   }
   await command.editReply({ content: joinLinesWithinDiscordLimit(lines) })
+}
+
+/**
+ * `/bridge sync-sounds`: makes the Harmony soundboard match the guild's. Mirror (default) also
+ * deletes Harmony sounds that are not on Discord, so a real run with deletes or replacements asks
+ * Confirm/Cancel first. Order: deletes, creates, updates; a rerun finishes whatever failed.
+ */
+export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
+  const mode = (command.options.getString('mode', false) ?? 'mirror') as SyncMode
+  const dryRun = command.options.getBoolean('dry_run', false) ?? false
+  await command.deferReply({ flags: MessageFlags.Ephemeral })
+
+  const guild = command.guild!
+  const bridge = rt.dir.getBridgeForDiscordGuild(guild.id)
+  if (!bridge) {
+    await command.editReply({ content: notBridgedText(rt) })
+    return
+  }
+  const serverId = bridge.harmonyServerId
+
+  let harmonyRows
+  try {
+    harmonyRows = await rt.harmony.getServerSounds(serverId)
+  } catch (err) {
+    if (err instanceof HarmonyHttpError && err.status === 404) {
+      await command.editReply({ content: '❌ Soundboard sync needs a newer Harmony (bridge soundboard endpoints).' })
+      return
+    }
+    throw err
+  }
+
+  let discordSounds
+  try {
+    discordSounds = [...(await guild.soundboardSounds.fetch()).values()]
+  } catch (err) {
+    await command.editReply({ content: `❌ Could not read the Discord soundboard: ${errorText(err)}` })
+    return
+  }
+
+  await rt.emojiLinks.ensure(serverId)
+  const harmonyEmojiFor = (id: string) => rt.emojiLinks.harmonyFor(serverId, id)?.id ?? null
+  const inputs = discordSounds.map(s => ({
+    soundId: s.soundId,
+    name: s.name,
+    volume: s.volume ?? 1,
+    emojiId: s.emoji?.id ?? null,
+    emojiName: s.emoji?.name ?? null,
+    available: s.available !== false,
+  }))
+  const discord = inputs.filter(s => s.available).map(s => desiredSound(s, harmonyEmojiFor))
+  const presentIds = inputs.filter(s => !s.available).map(s => s.soundId)
+
+  const plan = planSync({
+    mode,
+    discord,
+    presentIds,
+    harmony: harmonyRows.map(harmonySyncItem),
+    differs: soundDiffers,
+  })
+  const reportOpts = { label: (n: string) => n, noun: 'sound' }
+
+  if (dryRun) {
+    await command.editReply({
+      content: joinLinesWithinDiscordLimit([
+        `🧪 **Dry run** (${mode}) for **${guild.name}**`,
+        ...syncReportLines(plan, { ...reportOpts, dryRun: true }),
+      ]),
+    })
+    return
+  }
+
+  const deletions = [...plan.delete, ...plan.replace.flatMap(r => r.harmony)]
+  const creations = [...plan.add, ...plan.replace.map(r => r.discord)]
+  if (deletions.length + creations.length + plan.update.length === 0) {
+    await command.editReply({ content: '✅ Soundboard already matches.' })
+    return
+  }
+
+  if (deletions.length > 0) {
+    const prompt = joinLinesWithinDiscordLimit([
+      ...syncReportLines(plan, { ...reportOpts, dryRun: false }),
+      `⚠️ This deletes ${deletions.length} Harmony sound(s). Confirm?`,
+    ])
+    if (!(await confirmAction(command, prompt))) return
+  }
+
+  const failures: string[] = []
+  const fail = (name: string, err: unknown) => {
+    const hint = err instanceof HarmonyHttpError && err.code === 'SOUND_LIMIT' ? ' (Harmony allows 48 sounds per server.)' : ''
+    failures.push(`${name}: ${errorText(err)}${hint}`)
+  }
+  const counts = { deleted: 0, created: 0, updated: 0 }
+  const applied: DesiredSound[] = []
+
+  for (const h of deletions) {
+    try {
+      await rt.harmony.deleteServerSound(serverId, h.id)
+      counts.deleted++
+    } catch (err) {
+      if (err instanceof HarmonyHttpError && err.status === 404) counts.deleted++
+      else fail(h.name, err)
+    }
+  }
+  for (const d of creations) {
+    try {
+      await rt.harmony.importDiscordSound(serverId, d, false)
+      counts.created++
+      applied.push(d)
+    } catch (err) {
+      fail(d.name, err)
+    }
+  }
+  for (const { discord: d } of plan.update) {
+    try {
+      await rt.harmony.importDiscordSound(serverId, d, true)
+      counts.updated++
+      applied.push(d)
+    } catch (err) {
+      fail(d.name, err)
+    }
+  }
+
+  const lines = [
+    `✅ Soundboard sync (${mode}) for **${guild.name}**`,
+    `• Added: ${counts.created}`,
+    `• Updated: ${counts.updated}`,
+    `• Deleted: ${counts.deleted}`,
+  ]
+  const noEmoji = applied.filter(d => d.hadUnimportedEmoji).length
+  if (noEmoji > 0) {
+    lines.push('', `Run \`/bridge import-emojis\` first to keep custom emoji on ${noEmoji} sound(s).`)
+  }
+  if (failures.length > 0) {
+    lines.push('', `⚠️ ${failures.length} failure(s):`, ...failures.slice(0, 15).map(f => `  • ${f}`))
+    if (failures.length > 15) lines.push(`  • …and ${failures.length - 15} more`)
+  }
+  await command.editReply({ content: joinLinesWithinDiscordLimit(lines), components: [] })
 }
