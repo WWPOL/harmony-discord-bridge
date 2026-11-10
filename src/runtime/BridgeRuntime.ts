@@ -148,6 +148,8 @@ export interface RuntimeHooks {
   harmonyAuthHint?: string
   /** Log line explaining a Discord token rejection. */
   discordTokenHint?: string
+  /** Polls for history import jobs now (used by `/bridge import`). Set while the import scheduler runs. */
+  kickImports?: () => void
 }
 
 export interface BridgeRuntimeOptions {
@@ -1865,8 +1867,18 @@ export class BridgeRuntime {
     return ch?.isThread?.() && ch.parentId ? ch.parentId : channelId
   }
 
+  /** The connected Discord client, or null while not ready. History import reads through it. */
+  discordClientForImport(): DiscordClient | null {
+    return this.discordState === 'ready' ? this.discord : null
+  }
+
+  /** The discord_user of the member who started a Discord thread (history import); null for the bridge's own. */
+  threadStarterForImport(thread: { id: string; ownerId: string | null }): Promise<Record<string, unknown> | null> {
+    return this.discordThreadStarter(thread)
+  }
+
   /** The discord_user of the member who started a Discord thread; null for the bridge's own. */
-  private async discordThreadStarter(thread: Pick<AnyThreadChannel, 'id' | 'ownerId'>): Promise<Record<string, unknown> | null> {
+  private async discordThreadStarter(thread: { id: string; ownerId: string | null }): Promise<Record<string, unknown> | null> {
     const ownerId = thread.ownerId
     if (!ownerId || ownerId === this.discord?.user?.id) return null
     const guild = (thread as Partial<AnyThreadChannel>).guild
