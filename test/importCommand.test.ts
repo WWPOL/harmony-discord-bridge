@@ -113,6 +113,18 @@ describe('/bridge import-history', () => {
     expect(edited(t)).toContain('#general: running, 50%, 42 messages')
   })
 
+  it('status of a finished run counts what that run added, and says up to date when nothing was new', async () => {
+    const t = setup({ action: 'status' })
+    t.api.listImports.mockResolvedValueOnce([job({ state: 'done', imported_count: 7 })])
+    await handleInteraction(t.rt, t.interaction)
+    expect(edited(t)).toContain('#general: done, 100%, 7 new messages')
+
+    const u = setup({ action: 'status' })
+    u.api.listImports.mockResolvedValueOnce([job({ state: 'done', imported_count: 0 })])
+    await handleInteraction(u.rt, u.interaction)
+    expect(edited(u)).toContain('#general: done, 100%, up to date')
+  })
+
   it('cancel cancels each active job in scope', async () => {
     const t = setup({ action: 'cancel' })
     await handleInteraction(t.rt, t.interaction)
