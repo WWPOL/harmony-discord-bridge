@@ -1057,7 +1057,7 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
       ...syncReportLines(plan, { ...reportOpts, dryRun: false }),
       `⚠️ This deletes ${deletions.length} Harmony sound(s). Confirm?`,
     ])
-    if (!(await confirmAction(command, prompt))) return
+    if (!(await confirmAction(command, prompt, undefined, rt.log))) return
   }
 
   const failures: string[] = []

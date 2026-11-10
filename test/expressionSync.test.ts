@@ -68,6 +68,14 @@ describe('planSync', () => {
     expect(p.add).toHaveLength(0)
   })
 
+  it('does not treat a same-name unlinked Discord item as colliding with a presentIds-linked Harmony item', () => {
+    const p = run('mirror', [d('1', 'x')], [h('H1', 'x', '5', 2)], ['5'])
+    expect(p.add.map(x => x.id)).toEqual(['1'])
+    expect(p.replace).toHaveLength(0)
+    expect(p.update).toHaveLength(0)
+    expect(p.delete).toHaveLength(0)
+  })
+
   it('never schedules one Harmony sound for two actions', () => {
     const p = run('mirror', [d('1', 'a'), d('2', 'a')], [h('H1', 'A')])
     expect(p.replace).toHaveLength(1)
