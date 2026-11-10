@@ -131,4 +131,57 @@ describe('runBridgeSyncSounds', () => {
     expect(t.calls).toEqual([])
     expect(t.replies.at(-1)!.content).toContain('already matches')
   })
+
+  it('mirror replace deletes the Harmony row then creates without update', async () => {
+    const t = setup({ discord: [discordSound('d1', 'horn')], harmony: [harmonyRow('h1', 'horn')], confirm: 'confirm' })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.calls).toEqual(['delete:h1', 'create:horn'])
+    expect(t.rt.harmony.importDiscordSound).toHaveBeenCalledWith('s1', expect.objectContaining({ name: 'horn' }), false)
+  })
+
+  it('updates a linked sound renamed on Discord and counts it', async () => {
+    const t = setup({ mode: 'merge', discord: [discordSound('d1', 'newname')], harmony: [harmonyRow('h1', 'oldname', 'd1')] })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.rt.harmony.importDiscordSound).toHaveBeenCalledTimes(1)
+    expect(t.rt.harmony.importDiscordSound).toHaveBeenCalledWith('s1', expect.objectContaining({ name: 'newname' }), true)
+    expect(t.replies.at(-1)!.content).toContain('Updated: 1')
+  })
+
+  it('reports the sound limit hint and a warning header when a create fails', async () => {
+    const t = setup({ mode: 'merge', discord: [discordSound('d1', 'horn')], harmony: [] })
+    t.rt.harmony.importDiscordSound.mockRejectedValue(new HarmonyHttpError('limit', 409, 'SOUND_LIMIT'))
+    await runBridgeSyncSounds(t.rt, t.command)
+    const content = t.replies.at(-1)!.content
+    expect(content).toContain('Harmony allows 48 sounds per server.')
+    expect(content).toContain('⚠️ Soundboard sync finished with 1 failure(s)')
+    expect(content).not.toContain('✅')
+  })
+
+  it('does not create the Discord sound when deleting the replaced Harmony sound fails', async () => {
+    const t = setup({ discord: [discordSound('d1', 'horn')], harmony: [harmonyRow('h1', 'horn')], confirm: 'confirm' })
+    t.rt.harmony.deleteServerSound.mockRejectedValue(new HarmonyHttpError('server error', 500))
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.rt.harmony.importDiscordSound).not.toHaveBeenCalled()
+    const content = t.replies.at(-1)!.content
+    expect(content).toContain('horn: not replaced, deleting the Harmony sound failed')
+    expect(content).toContain('1 failure(s)')
+    expect(content).toContain('⚠️ Soundboard sync finished with 1 failure(s)')
+  })
+
+  it('creates after a 404 delete of a replaced sound', async () => {
+    const t = setup({ discord: [discordSound('d1', 'horn')], harmony: [harmonyRow('h1', 'horn')], confirm: 'confirm' })
+    t.rt.harmony.deleteServerSound.mockRejectedValue(new HarmonyHttpError('gone', 404))
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.calls).toEqual(['create:horn'])
+  })
+
+  it('hints at /bridge import-emojis when an applied sound had an unimported custom emoji', async () => {
+    const t = setup({
+      mode: 'merge',
+      discord: [discordSound('d1', 'horn', { emoji: { id: 'e1', name: 'party' } })],
+      harmony: [],
+    })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.replies.at(-1)!.content).toContain('/bridge import-emojis')
+  })
 })

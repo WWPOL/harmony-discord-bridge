@@ -1068,16 +1068,35 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
   const counts = { deleted: 0, created: 0, updated: 0 }
   const applied: DesiredSound[] = []
 
-  for (const h of deletions) {
+  const tryDelete = async (h: { id: string }): Promise<unknown> => {
     try {
       await rt.harmony.deleteServerSound(serverId, h.id)
       counts.deleted++
     } catch (err) {
       if (err instanceof HarmonyHttpError && err.status === 404) counts.deleted++
-      else fail(h.name, err)
+      else return err
+    }
+    return null
+  }
+  for (const h of plan.delete) {
+    const err = await tryDelete(h)
+    if (err) fail(h.name, err)
+  }
+  // A replaced sound is only recreated on Discord's name if every old Harmony row is gone.
+  const blocked = new Set<string>()
+  for (const r of plan.replace) {
+    let deleteError: unknown = null
+    for (const h of r.harmony) {
+      const err = await tryDelete(h)
+      if (err && !deleteError) deleteError = err
+    }
+    if (deleteError) {
+      blocked.add(r.discord.id)
+      failures.push(`${r.discord.name}: not replaced, deleting the Harmony sound failed: ${errorText(deleteError)}`)
     }
   }
   for (const d of creations) {
+    if (blocked.has(d.id)) continue
     try {
       await rt.harmony.importDiscordSound(serverId, d, false)
       counts.created++
@@ -1097,7 +1116,9 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
   }
 
   const lines = [
-    `✅ Soundboard sync (${mode}) for **${guild.name}**`,
+    failures.length > 0
+      ? `⚠️ Soundboard sync finished with ${failures.length} failure(s) (${mode}) for **${guild.name}**`
+      : `✅ Soundboard sync (${mode}) for **${guild.name}**`,
     `• Added: ${counts.created}`,
     `• Updated: ${counts.updated}`,
     `• Deleted: ${counts.deleted}`,
