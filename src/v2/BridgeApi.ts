@@ -34,6 +34,8 @@ export interface BridgeV2Config {
   history_import?: { enabled: boolean; reason: 'instance_off' | 'bridge_mode' | null }
   /** Changes whenever the server's opt-out list changes. Absent or null: the gateway has no privacy routes. */
   privacy_version?: string | null
+  /** Harmony permission names, index = bit position. Absent on older Harmony. */
+  permission_bits?: string[]
 }
 
 /** POST /bridge/v2/redeem */
@@ -418,6 +420,7 @@ export class BridgeApi {
       ...(typeof body.base_url === 'string' && body.base_url ? { base_url: body.base_url } : {}),
       history_import: historyImportOf(body.history_import),
       privacy_version: typeof body.privacy_version === 'string' ? body.privacy_version : null,
+      ...(Array.isArray(body.permission_bits) ? { permission_bits: body.permission_bits.map(String) } : {}),
     }
   }
 
