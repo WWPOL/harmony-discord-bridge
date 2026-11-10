@@ -43,6 +43,14 @@ function setup(opts: { admin?: boolean; action?: string | null; scope?: string |
     hooks: { kickImports: kick, ...(opts.api === false ? {} : { importApi: api }), harmonyChannels: () => [{ id: 'h1', name: 'general' }] },
   }
   const reply = vi.fn(async (_arg: any) => {})
+  const order: string[] = []
+  for (const [name, fn] of Object.entries(api)) {
+    const orig = fn as any
+    ;(api as any)[name] = vi.fn(async (...args: any[]) => { order.push(name); return orig(...args) })
+  }
+  const deferReply = vi.fn(async (_arg: any) => { order.push('defer'); interaction.deferred = true })
+  const editReply = vi.fn(async (_arg: any) => {})
+  const followUp = vi.fn(async (_arg: any) => {})
   const interaction: any = {
     isAutocomplete: () => false,
     isChatInputCommand: () => true,
@@ -56,11 +64,12 @@ function setup(opts: { admin?: boolean; action?: string | null; scope?: string |
       getSubcommand: () => 'import-history',
       getString: (name: string) => (name === 'action' ? opts.action ?? null : opts.scope ?? null),
     },
-    reply, deferred: false, replied: false,
+    reply, deferReply, editReply, followUp, deferred: false, replied: false,
   }
-  return { rt, interaction, api, kick, reply }
+  return { rt, interaction, api, kick, reply, deferReply, editReply, followUp, order }
 }
 const text = (reply: { mock: { calls: any[][] } }) => reply.mock.calls[0][0].content as string
+const edited = (t: { editReply: { mock: { calls: any[][] } } }) => t.editReply.mock.calls[0][0].content as string
 
 describe('/bridge import-history', () => {
   it('is registered for v2 only', () => {
@@ -81,8 +90,8 @@ describe('/bridge import-history', () => {
     await handleInteraction(t.rt, t.interaction)
     expect(t.api.startImports).toHaveBeenCalledWith(['d1'])
     expect(t.kick).toHaveBeenCalled()
-    expect(text(t.reply)).toContain('Importing history for 1 channel(s)')
-    expect(t.reply.mock.calls[0][0].flags).toBeDefined()
+    expect(edited(t)).toContain('Importing history for 1 channel(s)')
+    expect(t.deferReply.mock.calls[0][0].flags).toBeDefined()
   })
 
   it('start in a thread uses the parent channel', async () => {
@@ -95,20 +104,20 @@ describe('/bridge import-history', () => {
     const t = setup({ scope: 'all' })
     await handleInteraction(t.rt, t.interaction)
     expect(t.api.startImports).toHaveBeenCalledWith(undefined)
-    expect(text(t.reply)).toContain('2 channel(s)')
+    expect(edited(t)).toContain('2 channel(s)')
   })
 
   it('status shows state, percent and message count', async () => {
     const t = setup({ action: 'status' })
     await handleInteraction(t.rt, t.interaction)
-    expect(text(t.reply)).toContain('#general: running, 50%, 42 messages')
+    expect(edited(t)).toContain('#general: running, 50%, 42 messages')
   })
 
   it('cancel cancels each active job in scope', async () => {
     const t = setup({ action: 'cancel' })
     await handleInteraction(t.rt, t.interaction)
     expect(t.api.cancelImport).toHaveBeenCalledWith('j1')
-    expect(text(t.reply)).toContain('Cancelling')
+    expect(edited(t)).toContain('Cancelling')
   })
 
   it('replies not bridged in an unpaired channel', async () => {
@@ -122,7 +131,62 @@ describe('/bridge import-history', () => {
     const t = setup()
     t.api.startImports.mockRejectedValueOnce(new BridgeApiError('x', 400, 'pair_not_importable'))
     await handleInteraction(t.rt, t.interaction)
-    expect(text(t.reply)).toContain("This channel's pair doesn't bring Discord messages to Harmony")
+    expect(edited(t)).toContain("This channel's pair doesn't bring Discord messages to Harmony")
+  })
+
+  it('defers before any API call and answers through editReply', async () => {
+    const t = setup()
+    await handleInteraction(t.rt, t.interaction)
+    expect(t.order[0]).toBe('defer')
+    expect(t.deferReply.mock.calls[0][0].flags).toBeDefined()
+    expect(t.reply).not.toHaveBeenCalled()
+    expect(t.editReply).toHaveBeenCalledTimes(1)
+  })
+
+  it('defers before listing on status and cancel too', async () => {
+    for (const action of ['status', 'cancel']) {
+      const t = setup({ action })
+      await handleInteraction(t.rt, t.interaction)
+      expect(t.order[0]).toBe('defer')
+      expect(t.reply).not.toHaveBeenCalled()
+    }
+  })
+
+  it('reports an API failure with followUp once deferred', async () => {
+    const t = setup()
+    t.api.startImports.mockRejectedValueOnce(new Error('boom'))
+    await handleInteraction(t.rt, t.interaction)
+    expect(t.followUp.mock.calls[0][0].content).toContain('boom')
+    expect(t.reply).not.toHaveBeenCalled()
+  })
+
+  it('says nothing to import when no channel qualifies', async () => {
+    const t = setup({ scope: 'all' })
+    t.api.startImports.mockResolvedValueOnce([])
+    await handleInteraction(t.rt, t.interaction)
+    expect(edited(t)).toBe('Nothing to import: no channel here brings Discord messages to Harmony.')
+  })
+
+  it.each([
+    ['pair_removed', 'pair removed'],
+    ['channel_encrypted', 'channel is now encrypted'],
+    ['discord_access_lost', 'the bot lost access to the Discord channel'],
+    ['bridge_stalled', 'the import stopped making progress'],
+    ['harmony_403', 'Harmony refused the import (403)'],
+  ])('status explains error %s', async (code, sentence) => {
+    const t = setup({ action: 'status' })
+    t.api.listImports.mockResolvedValueOnce([job({ state: 'failed', error: code })])
+    await handleInteraction(t.rt, t.interaction)
+    expect(edited(t)).toContain(sentence)
+    expect(edited(t)).not.toContain(code)
+  })
+
+  it('status shows cancelling when a cancel is requested', async () => {
+    const t = setup({ action: 'status' })
+    t.api.listImports.mockResolvedValueOnce([job({ cancel_requested: true })])
+    await handleInteraction(t.rt, t.interaction)
+    expect(edited(t)).toContain('cancelling')
+    expect(edited(t)).not.toContain('running')
   })
 
   it('says importing needs the current bridge setup without the import api', async () => {
