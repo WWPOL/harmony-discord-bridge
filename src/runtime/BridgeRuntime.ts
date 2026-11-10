@@ -1905,12 +1905,27 @@ export class BridgeRuntime {
     }
   }
 
-  /** Guild member of a message's author: carries the server nickname. Null once they have left. */
-  private async guildMemberFor(msg: DiscordMessage) {
+  /** Authors found to have left their guild, by `guild:author` -> expiry (ms). Used only by history import. */
+  private readonly absentMembers = new Map<string, number>()
+
+  /**
+   * Guild member of a message's author: carries the server nickname. Null once they have left.
+   * `rememberAbsent` (history import) skips the REST lookup for an hour after a miss, so a departed
+   * author's hundreds of messages do not each cost a 404 on the shared REST queue.
+   */
+  private async guildMemberFor(msg: DiscordMessage, rememberAbsent = false) {
     let guildMember = msg.member
     if (!guildMember && msg.guild) {
-      guildMember = msg.guild.members.cache.get(msg.author.id)
-        ?? await msg.guild.members.fetch(msg.author.id).catch(() => null)
+      guildMember = msg.guild.members.cache.get(msg.author.id) ?? null
+      if (!guildMember) {
+        const key = `${msg.guild.id}:${msg.author.id}`
+        if (rememberAbsent && (this.absentMembers.get(key) ?? 0) > Date.now()) return null
+        guildMember = await msg.guild.members.fetch(msg.author.id).catch(() => null)
+        if (rememberAbsent && !guildMember) {
+          if (this.absentMembers.size >= 5000) this.absentMembers.clear()
+          this.absentMembers.set(key, Date.now() + 3_600_000)
+        }
+      }
     }
     return guildMember
   }
@@ -1924,7 +1939,7 @@ export class BridgeRuntime {
     if (msg.author.bot) return null
     if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) return null
 
-    const guildMember = await this.guildMemberFor(msg)
+    const guildMember = await this.guildMemberFor(msg, true)
     const content = this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(await this.emojiServerFor(msg.guildId)), { content: msg.content ?? '' })
     if (content.length === 0) return null
 
