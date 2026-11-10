@@ -916,11 +916,6 @@ export function roleSyncSummary(guildName: string, report: RoleSyncReport, linke
 
 const ACTIVE_IMPORT_STATES = new Set(['queued', 'running', 'paused'])
 
-/**
- * `/bridge import-history`: start, check or cancel the import of old Discord messages into
- * Harmony. The work runs in the import scheduler; this only talks to the import routes.
- * A thread counts as its parent channel.
- */
 /** Short sentences for the error codes an import job can carry. */
 function importErrorText(code: string): string {
   switch (code) {
@@ -933,6 +928,11 @@ function importErrorText(code: string): string {
   return refused ? `Harmony refused the import (${refused[1]})` : code
 }
 
+/**
+ * `/bridge import-history`: start, check or cancel the import of old Discord messages into
+ * Harmony. The work runs in the import scheduler; this only talks to the import routes.
+ * A thread counts as its parent channel.
+ */
 async function runBridgeImportHistory(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
   const api = rt.hooks.importApi
   if (!api) {
