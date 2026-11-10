@@ -25,6 +25,8 @@ import { DiscordAuthorLimiter } from './antiSpam.js'
 import { memberJoinedAt } from '../utils/discordUserMetadata.js'
 import { isAutomodBlocked } from '../HarmonyClient.js'
 import { errorText } from '../log.js'
+import { BridgeApiError, type ImportJob } from '../v2/BridgeApi.js'
+import { importPercent } from './importProgress.js'
 
 // =============================================================================
 // Command definitions
@@ -118,6 +120,27 @@ export function buildCommands(mode: 'v1' | 'v2') {
         .setDescription('Copy this server\'s custom emojis into the Harmony server (rerun adds only new ones)')
         .addBooleanOption(opt =>
           opt.setName('dry_run').setDescription('List what would be imported without changes').setRequired(false)))
+      .addSubcommand(sub =>
+        sub
+          .setName('import-history')
+          .setDescription('Import old Discord messages into Harmony (start, check or cancel)')
+          .addStringOption(opt =>
+            opt.setName('action')
+              .setDescription('What to do (default: start)')
+              .setRequired(false)
+              .addChoices(
+                { name: 'Start', value: 'start' },
+                { name: 'Status', value: 'status' },
+                { name: 'Cancel', value: 'cancel' },
+              ))
+          .addStringOption(opt =>
+            opt.setName('scope')
+              .setDescription('This channel or every bridged channel (default: this channel)')
+              .setRequired(false)
+              .addChoices(
+                { name: 'This channel', value: 'channel' },
+                { name: 'All bridged channels', value: 'all' },
+              )))
   }
 
   return [
@@ -384,6 +407,9 @@ async function handleBridgeCommand(rt: BridgeRuntime, command: ChatInputCommandI
         break
       case 'import-emojis':
         await runBridgeImportEmojis(rt, command)
+        break
+      case 'import-history':
+        await runBridgeImportHistory(rt, command)
         break
       default:
         await command.reply({ content: `❌ Unknown subcommand: ${sub}`, flags: MessageFlags.Ephemeral })
@@ -886,6 +912,72 @@ export function roleSyncSummary(guildName: string, report: RoleSyncReport, linke
     }
   }
   return lines
+}
+
+const ACTIVE_IMPORT_STATES = new Set(['queued', 'running', 'paused'])
+
+/**
+ * `/bridge import-history`: start, check or cancel the import of old Discord messages into
+ * Harmony. The work runs in the import scheduler; this only talks to the import routes.
+ * A thread counts as its parent channel.
+ */
+async function runBridgeImportHistory(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
+  const ephemeral = (content: string) => command.reply({ content, flags: MessageFlags.Ephemeral })
+  const api = rt.hooks.importApi
+  if (!api) {
+    await ephemeral('❌ Importing history needs the current bridge setup (set up from Harmony → Server Settings → Discord Bridge).')
+    return
+  }
+  const action = command.options.getString('action', false) ?? 'start'
+  const all = (command.options.getString('scope', false) ?? 'channel') === 'all'
+
+  const channel = command.channel
+  const pairId = channel?.isThread() && channel.parentId ? channel.parentId : command.channelId
+  if (!all && !rt.dir.getHarmonyChannel(pairId)) {
+    await ephemeral('❌ This channel isn\'t bridged.')
+    return
+  }
+
+  if (action === 'start') {
+    try {
+      const jobs = await api.startImports(all ? undefined : [pairId])
+      rt.hooks.kickImports?.()
+      await ephemeral(`✅ Importing history for ${jobs.length} channel(s). Progress shows in Harmony under Server settings → Discord Bridge, or run \`/bridge import-history action:status\`.`)
+    } catch (err) {
+      if (err instanceof BridgeApiError && err.code === 'pair_not_importable') {
+        await ephemeral('❌ This channel\'s pair doesn\'t bring Discord messages to Harmony.')
+        return
+      }
+      throw err
+    }
+    return
+  }
+
+  const inScope = (await api.listImports()).filter(j => all || j.discord_channel_id === pairId)
+  if (action === 'cancel') {
+    const active = inScope.filter(j => ACTIVE_IMPORT_STATES.has(j.state))
+    for (const j of active) await api.cancelImport(j.id)
+    await ephemeral(active.length > 0 ? 'Cancelling…' : 'No import is running or queued here.')
+    return
+  }
+
+  // status: the newest job of each channel.
+  const latest = new Map<string, ImportJob>()
+  for (const j of inScope) {
+    const seen = latest.get(j.discord_channel_id)
+    if (!seen || j.created_at > seen.created_at) latest.set(j.discord_channel_id, j)
+  }
+  if (latest.size === 0) {
+    await ephemeral('No imports yet. Run `/bridge import-history` to start one.')
+    return
+  }
+  const lines = ['**History imports**']
+  for (const j of latest.values()) {
+    const pct = importPercent(j)
+    const parts = [j.state, pct === null ? '-' : `${pct}%`, `${j.imported_count} messages`]
+    lines.push(`• ${harmonyChannelName(rt, j.harmony_channel_id)}: ${parts.join(', ')}${j.error ? ` (${j.error})` : ''}`)
+  }
+  await command.reply({ content: joinLinesWithinDiscordLimit(lines), flags: MessageFlags.Ephemeral })
 }
 
 /** Discord emoji imported per call; Harmony stores each image, so a run is bounded. */

@@ -280,6 +280,7 @@ export class V2Bridge {
         harmonyAuthHint: this.opts.authHint,
         discordTokenHint: this.opts.discordTokenHint,
         kickImports: () => this.kickImports(),
+        importApi: this.opts.import ? this.api : undefined,
       },
     }
     const runtime = (this.opts.createRuntime ?? ((o) => new BridgeRuntime(o)))(runtimeOptions)

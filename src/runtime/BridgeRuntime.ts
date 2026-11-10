@@ -65,7 +65,7 @@ import { ServerEmojiLinks } from './serverEmojiLinks.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
 import type { FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
-import type { ImportMessage } from '../v2/BridgeApi.js'
+import type { BridgeApi, ImportMessage } from '../v2/BridgeApi.js'
 import type { DiscordGuildView, PrivilegedIntent, Problem } from '../problems.js'
 import { collectGuildViews } from '../v2/selfCheck.js'
 import type { PairDirectory, PairWriter } from './PairDirectory.js'
@@ -150,6 +150,8 @@ export interface RuntimeHooks {
   discordTokenHint?: string
   /** Polls for history import jobs now (used by `/bridge import`). Set while the import scheduler runs. */
   kickImports?: () => void
+  /** History import routes for `/bridge import-history`. Absent when the bridge cannot import. */
+  importApi?: Pick<BridgeApi, 'listImports' | 'startImports' | 'cancelImport'>
 }
 
 export interface BridgeRuntimeOptions {
