@@ -593,4 +593,31 @@ describe('BridgeRuntime.translateForImport', () => {
     expect(plain).toMatchObject({ reply_to_discord_message_id: null, edited_at: null })
     await runtime.stop()
   })
+
+  it('imports bot and webhook authors listed in BRIDGE_IMPORT_TEST_AUTHORS (testing only)', async () => {
+    vi.stubEnv('BRIDGE_IMPORT_TEST_AUTHORS', ' wh-1 , bot-2 ')
+    try {
+      const { runtime, rt } = await runtimeSetup()
+      const webhook = await rt.translateForImport(dMsg({ webhookId: 'wh-1', member: null, author: { ...dMsg().author, id: 'wh-1', bot: true, username: 'Alice' } }))
+      expect(webhook).not.toBeNull()
+      expect(webhook!.discord_user).toMatchObject({ id: 'wh-1', username: 'Alice' })
+      expect(await rt.translateForImport(dMsg({ author: { ...dMsg().author, id: 'bot-2', bot: true } }))).not.toBeNull()
+      // Unlisted bots and webhooks stay skipped; live relay ignores the setting.
+      expect(await rt.translateForImport(dMsg({ webhookId: 'wh-9', author: { ...dMsg().author, id: 'wh-9', bot: true } }))).toBeNull()
+      await runtime.stop()
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('skips every bot when BRIDGE_IMPORT_TEST_AUTHORS is unset', async () => {
+    vi.stubEnv('BRIDGE_IMPORT_TEST_AUTHORS', '')
+    try {
+      const { runtime, rt } = await runtimeSetup()
+      expect(await rt.translateForImport(dMsg({ webhookId: 'wh-1', author: { ...dMsg().author, id: 'wh-1', bot: true } }))).toBeNull()
+      await runtime.stop()
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
 })
