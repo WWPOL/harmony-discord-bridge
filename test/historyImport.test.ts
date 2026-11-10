@@ -136,19 +136,6 @@ describe('HistoryImporter messages phase', () => {
     expect(patches.find(p => 'reached_discord_message_id' in p)!.reached_discord_message_id).toBe(SNOW(1))
   })
 
-  it('posts a message whose author has no guild member with the User-only discord_user', async () => {
-    const all = history(1)
-    const { importer, posts, j } = setup({
-      all,
-      translate: async (m: any) => ({
-        discord_message_id: m.id, created_at: m.createdAt.toISOString(), edited_at: null,
-        content: [{ type: 'text', text: 'x' }], discord_user: { id: 'u1', username: 'gone' }, reply_to_discord_message_id: null,
-      }),
-    })
-    await importer.run(j, new AbortController().signal)
-    expect(posts[0][0].discord_user).toEqual({ id: 'u1', username: 'gone' })
-  })
-
   it('sets pinned from the pin set', async () => {
     const { importer, posts, j } = setup({ all: history(3), pins: new Set([SNOW(2)]) })
     await importer.run(j, new AbortController().signal)
@@ -338,6 +325,45 @@ describe('BridgeRuntime.translateForImport', () => {
     expect(imported!.edited_at).toBe('2026-02-03T05:00:00.000Z')
     expect(imported!.reply_to_discord_message_id).toBe('8000')
     await runtime.stop()
+  })
+
+  /** Live relay and import must agree on content and discord_user for the same message. */
+  async function expectSameAsLive(over: Record<string, any>) {
+    const { runtime, rt, sendMessage } = await runtimeSetup()
+    await rt.onDiscordMessage(dMsg({ reference: null, ...over }))
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+    const live = sendMessage.mock.calls[0]
+    const imported = await rt.translateForImport(dMsg({ reference: null, ...over }))
+    expect(imported).not.toBeNull()
+    expect(imported!.content.length).toBeGreaterThan(0)
+    expect(imported!.content).toEqual(live[1])
+    expect(imported!.discord_user).toEqual((live[2] as any).discord_user)
+    await runtime.stop()
+    return imported!
+  }
+
+  it('imports a departed author (no guild member) with the same discord_user as live relay', async () => {
+    const guild = { id: 'g1', members: { cache: new Map(), fetch: vi.fn(async () => { throw new Error('Unknown Member') }) } }
+    const imported = await expectSameAsLive({ member: null, guild })
+    expect(guild.members.fetch).toHaveBeenCalled()
+    expect(imported.discord_user).toMatchObject({ id: 'du-1', username: 'user-du-1' })
+    expect(imported.discord_user).not.toHaveProperty('joined_at')
+  })
+
+  it('imports an attachment-only message like live relay', async () => {
+    const imported = await expectSameAsLive({
+      content: '',
+      attachments: new Collection([['a1', { id: 'a1', name: 'pic.png', contentType: 'image/png', url: 'https://cdn.discordapp.com/pic.png', size: 10 }]]),
+    })
+    expect(imported.content).toEqual([expect.objectContaining({ type: 'file', fileName: 'pic.png' })])
+  })
+
+  it('imports a sticker-only message like live relay', async () => {
+    const imported = await expectSameAsLive({
+      content: '',
+      stickers: new Collection([['s1', { id: 's1', name: 'wave', format: 1 }]]),
+    })
+    expect(imported.content).toEqual([expect.objectContaining({ type: 'file', fileType: 'image' })])
   })
 
   it('returns null for bots, other message types and empty parts; null reply and edit by default', async () => {
