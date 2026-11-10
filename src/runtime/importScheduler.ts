@@ -52,7 +52,7 @@ export class ImportSlots {
 }
 
 export interface ImportSchedulerDeps {
-  api: Pick<BridgeApi, 'listImports'>
+  api: Pick<BridgeApi, 'listImports' | 'updateImport'>
   importer: { run(job: ImportJob, signal: AbortSignal): Promise<ImportResult> }
   slots: ImportSlots
   pollMs: number
@@ -70,11 +70,23 @@ export interface ImportSchedulerDeps {
 
 const PRIORITY: Partial<Record<ImportJob['state'], number>> = { running: 0, paused: 1, queued: 2 }
 
-/** Picks the job to work on: `running` (left by a crash), then `paused`, then `queued` by creation time. */
-function nextJob(jobs: ImportJob[]): ImportJob | null {
+/** Consecutive pauses without any progress after which a job is failed as stalled. */
+const STALL_LIMIT = 3
+
+/** What counts as progress between two pauses of a job. */
+const fingerprint = (j: ImportJob) =>
+  JSON.stringify([j.reached_discord_message_id, j.phase, j.thread_cursor, j.threads_done])
+
+/**
+ * Picks the job to work on: jobs this process did not just pause first (`running` left by a crash,
+ * then `paused`, then `queued` by creation time), then the ones it paused, least recently paused
+ * first, so one stuck job never blocks the others.
+ */
+function nextJob(jobs: ImportJob[], pausedAt: ReadonlyMap<string, number>): ImportJob | null {
   const pending = jobs.filter(j => PRIORITY[j.state] !== undefined)
   pending.sort((a, b) =>
-    PRIORITY[a.state]! - PRIORITY[b.state]!
+    (pausedAt.get(a.id) ?? 0) - (pausedAt.get(b.id) ?? 0)
+    || PRIORITY[a.state]! - PRIORITY[b.state]!
     || Date.parse(a.created_at) - Date.parse(b.created_at)
     || a.id.localeCompare(b.id))
   return pending[0] ?? null
@@ -91,6 +103,11 @@ export class ImportScheduler {
   private abort: AbortController | null = null
   private stopped = true
   private lastPollError = ''
+  /** In memory: when (a counter) this process last saw each job pause; 0/absent = not paused by us. */
+  private readonly pausedAt = new Map<string, number>()
+  private pauseCounter = 0
+  /** In memory: the progress fingerprint at the last pause and how many pauses in a row left it unchanged. */
+  private readonly stalls = new Map<string, { fingerprint: string; count: number }>()
 
   constructor(private readonly deps: ImportSchedulerDeps) {}
 
@@ -134,7 +151,10 @@ export class ImportScheduler {
     }
     if (this.stopped || this.current) return
 
-    const job = nextJob(jobs)
+    for (const id of [...this.pausedAt.keys()]) {
+      if (!jobs.some(j => j.id === id && PRIORITY[j.state] !== undefined)) { this.pausedAt.delete(id); this.stalls.delete(id) }
+    }
+    const job = nextJob(jobs, this.pausedAt)
     if (!job) {
       problems?.clear()
       return
@@ -172,6 +192,51 @@ export class ImportScheduler {
     }
     // Over for good: the problems it raised no longer apply. A paused job resumes and keeps them.
     if (result === 'done' || result === 'failed' || result === 'cancelled') problems?.clear()
-    if (result && result !== 'paused' && !signal.aborted) setImmediate(() => this.kick())
+    if (!result || signal.aborted) return
+    // A job still pending after pausing (or after a failed PATCH) waits for the normal poll.
+    let again = true
+    if (result === 'paused' || result === 'failed') again = !(await this.afterStop(first.id, result))
+    else this.forget(first.id)
+    if (again && !this.stopped) setImmediate(() => this.kick())
+  }
+
+  private forget(id: string): void {
+    this.pausedAt.delete(id)
+    this.stalls.delete(id)
+  }
+
+  /**
+   * Bookkeeping after a job paused or failed: remembers the pause (so other jobs go first) and
+   * fails a job that paused STALL_LIMIT times in a row without progress. Returns whether the job
+   * is still pending on the server.
+   */
+  private async afterStop(id: string, result: ImportResult): Promise<boolean> {
+    const { api, log } = this.deps
+    let latest: ImportJob | undefined
+    try {
+      latest = (await api.listImports()).find(j => j.id === id)
+    } catch {
+      return true
+    }
+    if (!latest || PRIORITY[latest.state] === undefined) {
+      this.forget(id)
+      return false
+    }
+    this.pausedAt.set(id, ++this.pauseCounter)
+    const fp = fingerprint(latest)
+    const prev = this.stalls.get(id)
+    const count = prev && prev.fingerprint === fp ? prev.count + 1 : 1
+    this.stalls.set(id, { fingerprint: fp, count })
+    if (count >= STALL_LIMIT) {
+      log?.warn(`History import ${id}: no progress after ${count} pauses, failing it`)
+      try {
+        await api.updateImport(id, { state: 'failed', error: 'bridge_stalled' })
+        this.forget(id)
+        return false
+      } catch (err) {
+        log?.warn(`History import ${id}: could not PATCH it failed: ${errorText(err)}`)
+      }
+    }
+    return true
   }
 }

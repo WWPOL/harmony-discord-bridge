@@ -38,7 +38,7 @@ function make(jobs: () => ImportJob[], over: Partial<ConstructorParameters<typeo
   const gate = gatedImporter()
   const slots = new ImportSlots(1)
   const scheduler = new ImportScheduler({
-    api: { listImports: vi.fn(async () => jobs()) },
+    api: { listImports: vi.fn(async () => jobs()), updateImport: vi.fn(async () => job('x')) },
     importer: gate.importer,
     slots,
     pollMs: 3_600_000,
@@ -89,7 +89,7 @@ describe('ImportScheduler', () => {
     const slots = new ImportSlots(1)
     const g1 = gatedImporter(); const g2 = gatedImporter()
     const mk = (id: string, g: ReturnType<typeof gatedImporter>) => new ImportScheduler({
-      api: { listImports: vi.fn(async () => [job(id)]) }, importer: g.importer, slots,
+      api: { listImports: vi.fn(async () => [job(id)]), updateImport: vi.fn(async () => job('x')) }, importer: g.importer, slots,
       pollMs: 3_600_000, intentsOk: () => true, log,
     })
     const s1 = mk('one', g1); const s2 = mk('two', g2)
@@ -118,7 +118,7 @@ describe('ImportScheduler', () => {
     const hold = await slots.acquire()
     const g = gatedImporter()
     const scheduler = new ImportScheduler({
-      api: { listImports: vi.fn(async () => [job('a')]) }, importer: g.importer, slots,
+      api: { listImports: vi.fn(async () => [job('a')]), updateImport: vi.fn(async () => job('x')) }, importer: g.importer, slots,
       pollMs: 3_600_000, intentsOk: () => true, log,
     })
     scheduler.start()
@@ -188,13 +188,70 @@ describe('ImportScheduler', () => {
     await scheduler.stop()
   })
 
+  it('fails a job as bridge_stalled after 3 pauses without progress', async () => {
+    const jobs = [job('a', { state: 'paused', reached_discord_message_id: '5' })]
+    const updateImport = vi.fn(async () => job('a'))
+    const { scheduler, calls } = make(() => jobs, { api: { listImports: vi.fn(async () => jobs), updateImport } })
+    scheduler.start()
+    for (let n = 1; n <= 3; n++) {
+      await vi.waitFor(() => expect(calls).toHaveLength(n))
+      expect(updateImport).not.toHaveBeenCalled()
+      calls[n - 1].release('paused')
+      if (n < 3) { await vi.waitFor(() => expect(updateImport).not.toHaveBeenCalled()); await new Promise(r => setTimeout(r, 5)); scheduler.kick() }
+    }
+    await vi.waitFor(() => expect(updateImport).toHaveBeenCalledWith('a', { state: 'failed', error: 'bridge_stalled' }))
+    await scheduler.stop()
+  })
+
+  it('resets the stall count when progress was made between pauses', async () => {
+    const jobs = [job('a', { state: 'paused', reached_discord_message_id: '9' })]
+    const updateImport = vi.fn(async () => job('a'))
+    const { scheduler, calls } = make(() => jobs, { api: { listImports: vi.fn(async () => jobs), updateImport } })
+    scheduler.start()
+    for (let n = 1; n <= 5; n++) {
+      await vi.waitFor(() => expect(calls).toHaveLength(n))
+      jobs[0] = job('a', { state: 'paused', reached_discord_message_id: String(9 - Math.floor(n / 2)) })
+      calls[n - 1].release('paused')
+      await new Promise(r => setTimeout(r, 5))
+      scheduler.kick()
+    }
+    await new Promise(r => setTimeout(r, 10))
+    expect(updateImport).not.toHaveBeenCalled()
+    await scheduler.stop()
+  })
+
+  it('lets a queued job run after another job just paused', async () => {
+    const jobs = [job('stuck', { state: 'paused' }), job('fresh', { created_at: '2026-01-02T00:00:00Z' })]
+    const { scheduler, calls } = make(() => jobs)
+    scheduler.start()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    expect(calls[0].job.id).toBe('stuck')
+    calls[0].release('paused')
+    await new Promise(r => setTimeout(r, 5))
+    scheduler.kick()
+    await vi.waitFor(() => expect(calls).toHaveLength(2))
+    expect(calls[1].job.id).toBe('fresh')
+    await scheduler.stop()
+  })
+
+  it('does not re-pick immediately a failed job that is still pending (its PATCH failed)', async () => {
+    const jobs = [job('a', { state: 'running' })]
+    const { scheduler, calls } = make(() => jobs)
+    scheduler.start()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    calls[0].release('failed')
+    await new Promise(r => setTimeout(r, 30))
+    expect(calls).toHaveLength(1)
+    await scheduler.stop()
+  })
+
   it('skips a job cancelled while it waited for its slot', async () => {
     const slots = new ImportSlots(1)
     const hold = await slots.acquire()
     let jobs = [job('a')]
     const g = gatedImporter()
     const scheduler = new ImportScheduler({
-      api: { listImports: vi.fn(async () => jobs) }, importer: g.importer, slots,
+      api: { listImports: vi.fn(async () => jobs), updateImport: vi.fn(async () => job('x')) }, importer: g.importer, slots,
       pollMs: 3_600_000, intentsOk: () => true, log,
     })
     scheduler.start()

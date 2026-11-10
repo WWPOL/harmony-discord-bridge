@@ -323,6 +323,44 @@ describe('HistoryImporter threads and replies phases', () => {
     expect(patches.filter(p => 'threads_done' in p).map(p => p.threads_done)).toEqual([1, 2])
   })
 
+  it('skips a thread whose own fetch says unknown channel and still finishes the job', async () => {
+    const { importer, api, fetchPage, posts, patches, j } = setup({
+      all: [], threadPages: [[thread(T1), thread(T2)]], threadMessages: { [T2]: threadMsgs(800, 2) },
+    })
+    const real = fetchPage.getMockImplementation()!
+    fetchPage.mockImplementation((c: string, b: string | undefined) => {
+      if (c === T1) return Promise.reject(discordError(10003))
+      return real(c, b)
+    })
+    expect(await importer.run(j, new AbortController().signal)).toBe('done')
+    expect(posts.map(p => p.length)).toEqual([2])
+    expect(patches.filter(p => 'threads_done' in p).map(p => p.threads_done)).toEqual([1, 2])
+    expect(patches.some(p => p.error === 'discord_access_lost')).toBe(false)
+    expect(api.importThread).toHaveBeenCalledTimes(2)
+  })
+
+  it('still fails the job when the channel listing loses access', async () => {
+    const { importer, listThreads, patches, j } = setup({ all: [] })
+    listThreads.mockRejectedValue(discordError(50001))
+    expect(await importer.run(j, new AbortController().signal)).toBe('failed')
+    expect(patches).toContainEqual({ state: 'failed', error: 'discord_access_lost' })
+  })
+
+  it('sleeps pageDelayMs and re-checks server state after every thread, even empty ones', async () => {
+    const { importer, api, sleeps, j } = setup({ all: [], threadPages: [[thread(T1), thread(T2)]] })
+    const before = api.listImports.mock.calls.length
+    await importer.run(j, new AbortController().signal)
+    expect(sleeps.filter(ms => ms === 7).length).toBeGreaterThanOrEqual(2)
+    expect(api.listImports.mock.calls.length - before).toBeGreaterThanOrEqual(2)
+  })
+
+  it('stops after a thread when the server says the job was cancelled', async () => {
+    const { importer, api, j } = setup({ all: [], threadPages: [[thread(T1), thread(T2)]] })
+    api.listImports.mockResolvedValue([job({ state: 'cancelled' })])
+    expect(await importer.run(j, new AbortController().signal)).toBe('cancelled')
+    expect(api.importThread).toHaveBeenCalledTimes(1)
+  })
+
   it('does not touch reached_* or start while importing a thread', async () => {
     const { importer, patches, j } = setup({
       all: [], threadPages: [[thread(T1)]], threadMessages: { [T1]: threadMsgs(700, 3) },
