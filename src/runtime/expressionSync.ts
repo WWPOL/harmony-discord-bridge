@@ -97,5 +97,7 @@ export function syncReportLines<D extends { name: string }, H extends { name: st
   section(v('Would delete', 'Delete'), '', plan.delete.map(x => x.name))
   section(v('Skipped', 'Skip'), ' (name already on Harmony)', plan.skip.map(x => x.discord.name))
   if (plan.unchanged > 0) lines.push(`Unchanged: ${plan.unchanged}`)
+  const nothingToDo = plan.add.length + plan.update.length + plan.replace.length + plan.delete.length + plan.skip.length === 0
+  if (opts.dryRun && nothingToDo) lines.push('Already matches: nothing to change')
   return lines
 }

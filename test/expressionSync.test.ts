@@ -92,6 +92,14 @@ describe('planSync', () => {
 })
 
 describe('syncReportLines', () => {
+  it('says the Harmony side already matches on an empty dry run only', () => {
+    const empty = { add: [], update: [], replace: [], skip: [], delete: [], unchanged: 3 }
+    const dry = syncReportLines(empty, { dryRun: true, label: (n: string) => n, noun: 'sound' })
+    expect(dry).toContain('Already matches: nothing to change')
+    const real = syncReportLines(empty, { dryRun: false, label: (n: string) => n, noun: 'sound' })
+    expect(real.join(' ')).not.toContain('Already matches')
+  })
+
   const label = (n: string) => n
   it('says Would add in a dry run, with pluralization', () => {
     const plan = run('mirror', [d('1', 'a')], [])
