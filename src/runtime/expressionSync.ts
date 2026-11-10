@@ -13,7 +13,12 @@ export interface SyncPlan<D, H> {
   add: D[]
   update: Array<{ discord: D; harmony: H }>
   replace: Array<{ discord: D; harmony: H[] }>
-  skip: Array<{ discord: D; harmony: H }>
+  /**
+   * Merge and add only: Harmony items that share a Discord item's name without being linked to it
+   * (never linked, or linked to a Discord item that is gone). Left as they are and reported; only
+   * mirror replaces them.
+   */
+  conflict: Array<{ discord: D; harmony: H[] }>
   delete: H[]
   unchanged: number
   /** Add mode only: linked items that changed on Discord but are left as they are. */
@@ -30,16 +35,18 @@ export function planSync<D extends SyncDiscordItem, H extends SyncHarmonyItem>(i
   differs: (d: D, h: H) => boolean
 }): SyncPlan<D, H> {
   const { mode, discord, harmony, differs } = input
-  const plan: SyncPlan<D, H> = { add: [], update: [], replace: [], skip: [], delete: [], unchanged: 0, outdated: 0 }
+  const plan: SyncPlan<D, H> = { add: [], update: [], replace: [], conflict: [], delete: [], unchanged: 0, outdated: 0 }
   const consumed = new Set<string>()
 
+  const present = new Set<string>([...discord.map(x => x.id), ...(input.presentIds ?? [])])
   const linkedByDiscord = new Map<string, H>()
   for (const hi of harmony) {
     if (hi.discordId && !linkedByDiscord.has(hi.discordId)) linkedByDiscord.set(hi.discordId, hi)
   }
+  // Name matching sees items without a live link: never linked, or linked to a Discord item that is gone.
   const unlinkedByName = new Map<string, H[]>()
   for (const hi of harmony) {
-    if (hi.discordId) continue
+    if (hi.discordId && present.has(hi.discordId)) continue
     const k = key(hi.name)
     const list = unlinkedByName.get(k)
     if (list) list.push(hi)
@@ -60,17 +67,23 @@ export function planSync<D extends SyncDiscordItem, H extends SyncHarmonyItem>(i
   for (const di of unlinkedDiscord) {
     const candidates = (unlinkedByName.get(key(di.name)) ?? []).filter(x => !consumed.has(x.id))
     if (candidates.length === 0) { plan.add.push(di); continue }
-    if (mode === 'add') {
-      consumed.add(candidates[0].id)
-      plan.skip.push({ discord: di, harmony: candidates[0] })
-    } else {
-      for (const c of candidates) consumed.add(c.id)
-      plan.replace.push({ discord: di, harmony: candidates })
+    for (const c of candidates) consumed.add(c.id)
+    if (mode === 'mirror') plan.replace.push({ discord: di, harmony: candidates })
+    else plan.conflict.push({ discord: di, harmony: candidates })
+  }
+
+  if (mode !== 'mirror') {
+    // A linked item renamed on Discord to a name an unlinked Harmony item holds: the update still
+    // runs where it can, and the holder is reported. Mirror deletes such holders instead.
+    for (const { discord: di } of plan.update) {
+      const holders = (unlinkedByName.get(key(di.name)) ?? []).filter(x => !consumed.has(x.id))
+      if (holders.length === 0) continue
+      for (const h of holders) consumed.add(h.id)
+      plan.conflict.push({ discord: di, harmony: holders })
     }
   }
 
   if (mode === 'mirror') {
-    const present = new Set<string>([...discord.map(x => x.id), ...(input.presentIds ?? [])])
     for (const hi of harmony) {
       if (consumed.has(hi.id)) continue
       if (hi.discordId && present.has(hi.discordId)) continue
@@ -81,6 +94,9 @@ export function planSync<D extends SyncDiscordItem, H extends SyncHarmonyItem>(i
 }
 
 const MAX_LISTED = 20
+
+/** How to resolve name clashes; merge and add never delete. */
+export const CONFLICT_HINT = "  To fix: delete or rename the Harmony one, leave it, or run `mode:mirror` to replace it with Discord's."
 
 export function syncReportLines<D extends { name: string }, H extends { name: string }>(plan: SyncPlan<D, H>, opts: {
   dryRun: boolean; label: (name: string) => string; noun: string
@@ -98,10 +114,11 @@ export function syncReportLines<D extends { name: string }, H extends { name: st
   section(v('Would update', 'Update'), '', plan.update.map(x => x.discord.name))
   section(v('Would replace', 'Replace'), ' (same name on Harmony)', plan.replace.map(x => x.discord.name))
   section(v('Would delete', 'Delete'), '', plan.delete.map(x => x.name))
-  section(v('Skipped', 'Skip'), ' (name already on Harmony)', plan.skip.map(x => x.discord.name))
+  section('Name clash:', ' (a Harmony one with the same name is not linked to it; left as is)', plan.conflict.map(x => x.discord.name))
+  if (plan.conflict.length > 0) lines.push(CONFLICT_HINT)
   if (plan.outdated > 0) lines.push(`Not updated (add mode): ${plan.outdated} changed on Discord; use merge or mirror to update`)
   if (plan.unchanged > 0) lines.push(`Unchanged: ${plan.unchanged}`)
-  const nothingToDo = plan.add.length + plan.update.length + plan.replace.length + plan.delete.length + plan.skip.length + plan.outdated === 0
+  const nothingToDo = plan.add.length + plan.update.length + plan.replace.length + plan.delete.length + plan.conflict.length + plan.outdated === 0
   if (opts.dryRun && nothingToDo) lines.push('Already matches: nothing to change')
   return lines
 }
