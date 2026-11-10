@@ -14,6 +14,8 @@ export type ProblemCode =
   | 'rate_limited'
   | 'discord_unreachable'
   | 'harmony_unreachable'
+  | 'private_threads_skipped'
+  | 'message_content_needed_for_import'
 
 export type PrivilegedIntent = 'message_content' | 'members' | 'presence'
 
@@ -129,6 +131,16 @@ export function describeProblem(p: Problem): { summary: string; fix: string } {
       return {
         summary: 'The bridge cannot reach Harmony.',
         fix: 'Check HARMONY_URL and the internet connection of the machine running the bridge.',
+      }
+    case 'private_threads_skipped':
+      return {
+        summary: `History import skipped the private threads of ${ch}: the bot cannot read them.`,
+        fix: 'Give the bot the Manage Threads permission on that channel, then import again.',
+      }
+    case 'message_content_needed_for_import':
+      return {
+        summary: 'A history import is waiting: Discord returns empty messages while the Message Content Intent is off.',
+        fix: 'Discord Developer Portal → your app → Bot → Privileged Gateway Intents → switch on "Message Content Intent". The import starts by itself.',
       }
   }
 }
