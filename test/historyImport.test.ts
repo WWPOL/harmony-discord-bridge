@@ -531,6 +531,20 @@ describe('BridgeRuntime.translateForImport', () => {
     await runtime.stop()
   })
 
+  it('looks up a departed author once across messages, but live relay still looks each time', async () => {
+    const { runtime, rt } = await runtimeSetup()
+    const fetch = vi.fn(async () => { throw discordError(10007) })
+    const guild = { id: 'g1', members: { cache: new Map(), fetch } }
+    const mk = (id: string) => dMsg({ id, member: null, guild })
+    await rt.translateForImport(mk('9001'))
+    await rt.translateForImport(mk('9002'))
+    expect(fetch).toHaveBeenCalledTimes(1)
+    await rt.guildMemberFor(mk('9003'))
+    await rt.guildMemberFor(mk('9004'))
+    expect(fetch).toHaveBeenCalledTimes(3)
+    await runtime.stop()
+  })
+
   /** Live relay and import must agree on content and discord_user for the same message. */
   async function expectSameAsLive(over: Record<string, any>) {
     const { runtime, rt, sendMessage } = await runtimeSetup()
