@@ -132,6 +132,23 @@ describe('runBridgeSyncSounds', () => {
     expect(t.replies.at(-1)!.content).toContain('already matches')
   })
 
+  it('merge reports a same-name Harmony sound and changes nothing', async () => {
+    const t = setup({ mode: 'merge', discord: [discordSound('d1', 'horn')], harmony: [harmonyRow('h1', 'horn')] })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.calls).toEqual([])
+    expect(t.rt.harmony.deleteServerSound).not.toHaveBeenCalled()
+    const content = t.replies.at(-1)!.content
+    expect(content).toContain('Name clash: 1 sound')
+    expect(content).not.toContain('Confirm')
+  })
+
+  it('merge reports a sound linked to a deleted Discord sound that holds the new name', async () => {
+    const t = setup({ mode: 'merge', discord: [discordSound('d2', 'horn')], harmony: [harmonyRow('h1', 'horn', 'd1')] })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.calls).toEqual([])
+    expect(t.replies.at(-1)!.content).toContain('Name clash: 1 sound')
+  })
+
   it('mirror replace deletes the Harmony row then creates without update', async () => {
     const t = setup({ discord: [discordSound('d1', 'horn')], harmony: [harmonyRow('h1', 'horn')], confirm: 'confirm' })
     await runBridgeSyncSounds(t.rt, t.command)
@@ -143,7 +160,7 @@ describe('runBridgeSyncSounds', () => {
     expect(content).toContain('Deleted: 0')
   })
 
-  it('add mode tells what it skipped instead of saying the soundboard matches', async () => {
+  it('add mode reports clashes and outdated sounds instead of saying the soundboard matches', async () => {
     const t = setup({
       mode: 'add',
       discord: [discordSound('d1', 'renamed'), discordSound('d2', 'horn')],
@@ -152,13 +169,14 @@ describe('runBridgeSyncSounds', () => {
     await runBridgeSyncSounds(t.rt, t.command)
     expect(t.calls).toEqual([])
     const content = t.replies.at(-1)!.content
-    expect(content).toContain('✅ Nothing to add (add)')
-    expect(content).toContain('Skip 1 sound (name already on Harmony)')
+    expect(content).toContain('⚠️ Nothing to apply (add)')
+    expect(content).toContain('Name clash: 1 sound')
+    expect(content).toContain('  • horn')
     expect(content).toContain('Not updated (add mode): 1 changed on Discord')
     expect(content).not.toContain('already matches')
   })
 
-  it('add mode summary counts skipped and outdated sounds next to what it added', async () => {
+  it('add mode summary lists clashes and counts outdated sounds next to what it added', async () => {
     const t = setup({
       mode: 'add',
       discord: [discordSound('d1', 'renamed'), discordSound('d2', 'horn'), discordSound('d3', 'new')],
@@ -168,7 +186,8 @@ describe('runBridgeSyncSounds', () => {
     expect(t.calls).toEqual(['create:new'])
     const content = t.replies.at(-1)!.content
     expect(content).toContain('Added: 1')
-    expect(content).toContain('Skipped (name already on Harmony): 1')
+    expect(content).toContain('⚠️ 1 name clash(es), left as they are:\n  • horn')
+    expect(content).toContain('run `mode:mirror` to replace it')
     expect(content).toContain('Not updated (add mode): 1; use merge or mirror to update')
   })
 

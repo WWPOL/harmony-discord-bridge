@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { planSync, syncReportLines, SYNC_MODE_CHOICES, type SyncDiscordItem, type SyncHarmonyItem } from '../src/runtime/expressionSync.js'
+import { CONFLICT_HINT, planSync, syncReportLines, SYNC_MODE_CHOICES, type SyncDiscordItem, type SyncHarmonyItem } from '../src/runtime/expressionSync.js'
 
 const d = (id: string, name: string, v = 1) => ({ id, name, v })
 const h = (id: string, name: string, discordId: string | null = null, v = 1) => ({ id, name, discordId, v })
@@ -41,17 +41,43 @@ describe('planSync', () => {
     expect(p.update).toHaveLength(0)
   })
 
-  it('treats case-insensitive name matches as collisions', () => {
-    for (const mode of ['mirror', 'merge'] as const) {
-      const p = run(mode, [d('1', 'airhorn')], [h('H1', 'AirHorn')])
-      expect(p.replace).toHaveLength(1)
-      expect(p.replace[0].harmony.map(x => x.id)).toEqual(['H1'])
-      expect(p.add).toHaveLength(0)
-      expect(p.delete).toHaveLength(0)
-    }
-    const p = run('add', [d('1', 'airhorn')], [h('H1', 'AirHorn')])
-    expect(p.skip.map(s => s.harmony.id)).toEqual(['H1'])
+  it('mirror replaces a case-insensitive name match; merge and add report it as a clash', () => {
+    const p = run('mirror', [d('1', 'airhorn')], [h('H1', 'AirHorn')])
+    expect(p.replace).toHaveLength(1)
+    expect(p.replace[0].harmony.map(x => x.id)).toEqual(['H1'])
+    expect(p.conflict).toHaveLength(0)
     expect(p.add).toHaveLength(0)
+    expect(p.delete).toHaveLength(0)
+    for (const mode of ['merge', 'add'] as const) {
+      const q = run(mode, [d('1', 'airhorn')], [h('H1', 'AirHorn')])
+      expect(q.conflict.map(c => [c.discord.id, c.harmony.map(x => x.id)])).toEqual([['1', ['H1']]])
+      expect(q.replace).toHaveLength(0)
+      expect(q.add).toHaveLength(0)
+      expect(q.delete).toHaveLength(0)
+    }
+  })
+
+  it('name-matches Harmony items linked to a Discord item that is gone', () => {
+    // H1 was imported from Discord item 9, deleted on Discord; a new Discord item reuses its name.
+    const harmony = [h('H1', 'horn', '9')]
+    const m = run('mirror', [d('2', 'horn')], harmony)
+    expect(m.replace.map(r => r.harmony.map(x => x.id))).toEqual([['H1']])
+    expect(m.delete).toHaveLength(0)
+    for (const mode of ['merge', 'add'] as const) {
+      const q = run(mode, [d('2', 'horn')], harmony)
+      expect(q.conflict.map(c => c.harmony.map(x => x.id))).toEqual([['H1']])
+      expect(q.add).toHaveLength(0)
+    }
+  })
+
+  it('merge reports an unlinked Harmony item holding the name a linked item is renamed to', () => {
+    const harmony = [h('H1', 'old', '1'), h('H2', 'new')]
+    const p = run('merge', [d('1', 'new', 2)], harmony)
+    expect(p.update.map(u => u.harmony.id)).toEqual(['H1'])
+    expect(p.conflict.map(c => [c.discord.id, c.harmony.map(x => x.id)])).toEqual([['1', ['H2']]])
+    const m = run('mirror', [d('1', 'new', 2)], harmony)
+    expect(m.conflict).toHaveLength(0)
+    expect(m.delete.map(x => x.id)).toEqual(['H2'])
   })
 
   it('mirror deletes Harmony-only and stale-linked items; merge and add delete nothing', () => {
@@ -90,26 +116,37 @@ describe('planSync', () => {
     expect(q.delete).toHaveLength(0)
 
     const s = run('add', [d('1', 'a'), d('2', 'a')], [h('H1', 'a')])
-    expect(s.skip.map(x => x.discord.id)).toEqual(['1'])
+    expect(s.conflict.map(x => x.discord.id)).toEqual(['1'])
     expect(s.add.map(x => x.id)).toEqual(['2'])
   })
 
-  it('skips the first of several same-name Harmony items in add mode', () => {
+  it('reports every same-name Harmony item of a clash', () => {
     const p = run('add', [d('1', 'a')], [h('H1', 'a'), h('H2', 'a')])
-    expect(p.skip.map(x => x.harmony.id)).toEqual(['H1'])
+    expect(p.conflict.map(x => x.harmony.map(y => y.id))).toEqual([['H1', 'H2']])
   })
 })
 
 describe('syncReportLines', () => {
   it('reports outdated add-mode items and does not call that a match', () => {
-    const plan = { add: [], update: [], replace: [], skip: [], delete: [], unchanged: 1, outdated: 2 }
+    const plan = { add: [], update: [], replace: [], conflict: [], delete: [], unchanged: 1, outdated: 2 }
     const dry = syncReportLines(plan, { dryRun: true, label: (n: string) => n, noun: 'sound' })
     expect(dry).toContain('Not updated (add mode): 2 changed on Discord; use merge or mirror to update')
     expect(dry.join(' ')).not.toContain('Already matches')
   })
 
+  it('lists clashes with the fix in dry and real runs, and does not call that a match', () => {
+    const plan = { add: [], update: [], replace: [], conflict: [{ discord: { name: 'horn' }, harmony: [{ name: 'Horn' }] }], delete: [], unchanged: 0, outdated: 0 }
+    for (const dryRun of [true, false]) {
+      const lines = syncReportLines(plan, { dryRun, label: (n: string) => n, noun: 'sound' })
+      expect(lines[0]).toBe('Name clash: 1 sound (a Harmony one with the same name is not linked to it; left as is)')
+      expect(lines).toContain('  • horn')
+      expect(lines).toContain(CONFLICT_HINT)
+      expect(lines.join(' ')).not.toContain('Already matches')
+    }
+  })
+
   it('says the Harmony side already matches on an empty dry run only', () => {
-    const empty = { add: [], update: [], replace: [], skip: [], delete: [], unchanged: 3, outdated: 0 }
+    const empty = { add: [], update: [], replace: [], conflict: [], delete: [], unchanged: 3, outdated: 0 }
     const dry = syncReportLines(empty, { dryRun: true, label: (n: string) => n, noun: 'sound' })
     expect(dry).toContain('Already matches: nothing to change')
     const real = syncReportLines(empty, { dryRun: false, label: (n: string) => n, noun: 'sound' })

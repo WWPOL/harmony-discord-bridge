@@ -26,7 +26,7 @@ import { memberJoinedAt } from '../utils/discordUserMetadata.js'
 import { isAutomodBlocked, HarmonyHttpError } from '../HarmonyClient.js'
 import { errorText } from '../log.js'
 import { confirmAction } from './confirmPrompt.js'
-import { planSync, syncReportLines, SYNC_MODE_CHOICES, type SyncMode } from './expressionSync.js'
+import { CONFLICT_HINT, planSync, syncReportLines, SYNC_MODE_CHOICES, type SyncMode } from './expressionSync.js'
 import { desiredSound, harmonySyncItem, soundDiffers, type DesiredSound } from './soundSync.js'
 
 // =============================================================================
@@ -1048,12 +1048,12 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
   const deletions = [...plan.delete, ...plan.replace.flatMap(r => r.harmony)]
   const creations = [...plan.add, ...plan.replace.map(r => r.discord)]
   if (deletions.length + creations.length + plan.update.length === 0) {
-    // Add mode can leave skipped or outdated sounds behind; say so instead of "matches".
-    const left = plan.skip.length + plan.outdated > 0
+    // Merge and add can leave clashing or outdated sounds behind; say so instead of "matches".
+    const left = plan.conflict.length + plan.outdated > 0
     await command.editReply({
       content: left
         ? joinLinesWithinDiscordLimit([
-          `✅ Nothing to add (${mode}) for **${guild.name}**`,
+          `${plan.conflict.length > 0 ? '⚠️' : '✅'} Nothing to apply (${mode}) for **${guild.name}**`,
           ...syncReportLines(plan, { ...reportOpts, dryRun: false }),
         ])
         : '✅ Soundboard already matches.',
@@ -1134,9 +1134,14 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
     `• Updated: ${counts.updated}`,
     ...(plan.replace.length > 0 ? [`• Replaced (same name on Harmony): ${counts.replaced}`] : []),
     `• Deleted: ${counts.deleted}`,
-    ...(plan.skip.length > 0 ? [`• Skipped (name already on Harmony): ${plan.skip.length}`] : []),
     ...(plan.outdated > 0 ? [`• Not updated (add mode): ${plan.outdated}; use merge or mirror to update`] : []),
   ]
+  if (plan.conflict.length > 0) {
+    const names = plan.conflict.map(c => c.discord.name)
+    lines.push('', `⚠️ ${names.length} name clash(es), left as they are:`, ...names.slice(0, 20).map(n => `  • ${n}`))
+    if (names.length > 20) lines.push(`  • …and ${names.length - 20} more`)
+    lines.push(CONFLICT_HINT)
+  }
   const noEmoji = applied.filter(d => d.hadUnimportedEmoji).length
   if (noEmoji > 0) {
     lines.push('', `Run \`/bridge import-emojis\` first to keep custom emoji on ${noEmoji} sound(s).`)
