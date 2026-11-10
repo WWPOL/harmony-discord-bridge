@@ -63,6 +63,13 @@ const ACCESS_LOST_CODES = new Set([50001, 50013, 10003])
 const RETRY_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000]
 const NO_PINS: ReadonlySet<string> = new Set()
 
+/** A thread's own Discord history is unreachable (deleted, no access): skip that thread, keep the job. */
+class ThreadSkip extends Error {
+  constructor(readonly code: number) {
+    super(`thread skipped: Discord error ${code}`)
+  }
+}
+
 /** Unwinds run() with its result. */
 class Stop extends Error {
   constructor(readonly result: ImportResult) {
@@ -135,6 +142,7 @@ export class HistoryImporter {
     let threadsDone = job.threads_done
     // Only a run that starts from the very top knows the full count.
     let fresh = !saved && threadsDone === 0
+    let skippedThreads = 0
 
     if (!this.deps.canReadPrivateThreads(channelId)) {
       log.warn(`History import ${job.id}: the bot cannot read private threads of ${channelId}; they are skipped`)
@@ -148,10 +156,20 @@ export class HistoryImporter {
       fresh = false
 
       for (let i = skip; i < threads.length; i++) {
-        await this.importThread(job, signal, threads[i])
+        try {
+          await this.importThread(job, signal, threads[i])
+        } catch (error) {
+          if (!(error instanceof ThreadSkip)) throw error
+          skippedThreads++
+          log.warn(`History import ${job.id}: skipping thread ${threads[i].id} (Discord error ${error.code}); ${skippedThreads} skipped so far`)
+        }
         threadsDone++
         const progress: ThreadProgress = i === threads.length - 1 && next ? { at: next, done: 0 } : { at, done: i + 1 }
         await this.patch(job, { threads_done: threadsDone, thread_cursor: { ...progress } }, signal)
+        if (signal.aborted) return this.stop(await this.pause(job))
+        await this.sleep(this.deps.pageDelayMs)
+        if (signal.aborted) return this.stop(await this.pause(job))
+        await this.checkServerState(job, signal)
       }
       if (!next) return
       at = next
@@ -161,7 +179,7 @@ export class HistoryImporter {
 
   private async importThread(job: ImportJob, signal: AbortSignal, thread: ImportThreadLike): Promise<void> {
     const channelId = job.discord_channel_id
-    const hasStarter = await this.discordCall(job, signal, () => this.deps.hasStarterMessage(channelId, thread.id))
+    const hasStarter = await this.discordCall(job, signal, () => this.deps.hasStarterMessage(channelId, thread.id), true)
     const discordUser = await this.deps.threadStarter(thread).catch(() => null) ?? null
     const harmonyThreadId = await this.harmonyCall(job, signal, () => this.deps.api.importThread(job.id, {
       discord_thread_id: thread.id,
@@ -173,7 +191,7 @@ export class HistoryImporter {
       locked: thread.locked ?? false,
     }))
     // Each thread restarts from its newest message; the server dedupes, so a repeat is safe.
-    await this.importPages(job, signal, { discordId: thread.id, harmonyThreadId, pins: NO_PINS })
+    await this.importPages(job, signal, { discordId: thread.id, harmonyThreadId, pins: NO_PINS }, true)
   }
 
   /**
@@ -185,6 +203,7 @@ export class HistoryImporter {
     job: ImportJob,
     signal: AbortSignal,
     scope: { discordId: string; harmonyThreadId: string | null; pins: ReadonlySet<string> },
+    skipOnLostAccess = false,
   ): Promise<void> {
     const { api, log } = this.deps
     const isChannel = scope.harmonyThreadId === null
@@ -193,7 +212,7 @@ export class HistoryImporter {
     for (;;) {
       if (signal.aborted) return this.stop(await this.pause(job))
 
-      const raw = await this.discordCall(job, signal, () => this.deps.fetchPage(scope.discordId, before))
+      const raw = await this.discordCall(job, signal, () => this.deps.fetchPage(scope.discordId, before), skipOnLostAccess)
       if (raw.length === 0) return
       // Newest first, whatever order the fetcher produced.
       const page = [...raw].sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : BigInt(a.id) > BigInt(b.id) ? -1 : 0))
@@ -307,16 +326,17 @@ export class HistoryImporter {
   }
 
   /**
-   * One Discord read. Lost access fails the job; other errors are retried with the same backoff,
+   * One Discord read. Lost access fails the job (for a thread's own reads, `skipThread`, it skips the thread instead); other errors are retried with the same backoff,
    * then the job is paused.
    */
-  private async discordCall<T>(job: ImportJob, signal: AbortSignal, call: () => Promise<T>): Promise<T> {
+  private async discordCall<T>(job: ImportJob, signal: AbortSignal, call: () => Promise<T>, skipThread = false): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       try {
         return await call()
       } catch (error) {
         const code = (error as { code?: unknown } | null)?.code
         if (typeof code === 'number' && ACCESS_LOST_CODES.has(code)) {
+          if (skipThread) throw new ThreadSkip(code)
           this.deps.log.warn(`History import ${job.id}: Discord access lost (${code})`)
           await this.bestEffortPatch(job.id, { state: 'failed', error: 'discord_access_lost' })
           throw new Stop('failed')
