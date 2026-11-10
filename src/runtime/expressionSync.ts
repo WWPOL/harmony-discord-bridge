@@ -16,6 +16,8 @@ export interface SyncPlan<D, H> {
   skip: Array<{ discord: D; harmony: H }>
   delete: H[]
   unchanged: number
+  /** Add mode only: linked items that changed on Discord but are left as they are. */
+  outdated: number
 }
 
 const key = (name: string): string => name.toLowerCase()
@@ -28,7 +30,7 @@ export function planSync<D extends SyncDiscordItem, H extends SyncHarmonyItem>(i
   differs: (d: D, h: H) => boolean
 }): SyncPlan<D, H> {
   const { mode, discord, harmony, differs } = input
-  const plan: SyncPlan<D, H> = { add: [], update: [], replace: [], skip: [], delete: [], unchanged: 0 }
+  const plan: SyncPlan<D, H> = { add: [], update: [], replace: [], skip: [], delete: [], unchanged: 0, outdated: 0 }
   const consumed = new Set<string>()
 
   const linkedByDiscord = new Map<string, H>()
@@ -50,8 +52,9 @@ export function planSync<D extends SyncDiscordItem, H extends SyncHarmonyItem>(i
     const linked = linkedByDiscord.get(di.id)
     if (!linked) { unlinkedDiscord.push(di); continue }
     consumed.add(linked.id)
-    if (mode !== 'add' && differs(di, linked)) plan.update.push({ discord: di, harmony: linked })
-    else plan.unchanged++
+    if (!differs(di, linked)) plan.unchanged++
+    else if (mode === 'add') plan.outdated++
+    else plan.update.push({ discord: di, harmony: linked })
   }
 
   for (const di of unlinkedDiscord) {
@@ -96,8 +99,9 @@ export function syncReportLines<D extends { name: string }, H extends { name: st
   section(v('Would replace', 'Replace'), ' (same name on Harmony)', plan.replace.map(x => x.discord.name))
   section(v('Would delete', 'Delete'), '', plan.delete.map(x => x.name))
   section(v('Skipped', 'Skip'), ' (name already on Harmony)', plan.skip.map(x => x.discord.name))
+  if (plan.outdated > 0) lines.push(`Not updated (add mode): ${plan.outdated} changed on Discord; use merge or mirror to update`)
   if (plan.unchanged > 0) lines.push(`Unchanged: ${plan.unchanged}`)
-  const nothingToDo = plan.add.length + plan.update.length + plan.replace.length + plan.delete.length + plan.skip.length === 0
+  const nothingToDo = plan.add.length + plan.update.length + plan.replace.length + plan.delete.length + plan.skip.length + plan.outdated === 0
   if (opts.dryRun && nothingToDo) lines.push('Already matches: nothing to change')
   return lines
 }

@@ -137,6 +137,39 @@ describe('runBridgeSyncSounds', () => {
     await runBridgeSyncSounds(t.rt, t.command)
     expect(t.calls).toEqual(['delete:h1', 'create:horn'])
     expect(t.rt.harmony.importDiscordSound).toHaveBeenCalledWith('s1', expect.objectContaining({ name: 'horn' }), false)
+    const content = t.replies.at(-1)!.content
+    expect(content).toContain('Added: 0')
+    expect(content).toContain('Replaced (same name on Harmony): 1')
+    expect(content).toContain('Deleted: 0')
+  })
+
+  it('add mode tells what it skipped instead of saying the soundboard matches', async () => {
+    const t = setup({
+      mode: 'add',
+      discord: [discordSound('d1', 'renamed'), discordSound('d2', 'horn')],
+      harmony: [harmonyRow('h1', 'old', 'd1'), harmonyRow('h2', 'horn')],
+    })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.calls).toEqual([])
+    const content = t.replies.at(-1)!.content
+    expect(content).toContain('✅ Nothing to add (add)')
+    expect(content).toContain('Skip 1 sound (name already on Harmony)')
+    expect(content).toContain('Not updated (add mode): 1 changed on Discord')
+    expect(content).not.toContain('already matches')
+  })
+
+  it('add mode summary counts skipped and outdated sounds next to what it added', async () => {
+    const t = setup({
+      mode: 'add',
+      discord: [discordSound('d1', 'renamed'), discordSound('d2', 'horn'), discordSound('d3', 'new')],
+      harmony: [harmonyRow('h1', 'old', 'd1'), harmonyRow('h2', 'horn')],
+    })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.calls).toEqual(['create:new'])
+    const content = t.replies.at(-1)!.content
+    expect(content).toContain('Added: 1')
+    expect(content).toContain('Skipped (name already on Harmony): 1')
+    expect(content).toContain('Not updated (add mode): 1; use merge or mirror to update')
   })
 
   it('updates a linked sound renamed on Discord and counts it', async () => {
@@ -147,12 +180,13 @@ describe('runBridgeSyncSounds', () => {
     expect(t.replies.at(-1)!.content).toContain('Updated: 1')
   })
 
-  it('reports the sound limit hint and a warning header when a create fails', async () => {
+  it('reports a full soundboard and a warning header when a create fails', async () => {
     const t = setup({ mode: 'merge', discord: [discordSound('d1', 'horn')], harmony: [] })
     t.rt.harmony.importDiscordSound.mockRejectedValue(new HarmonyHttpError('limit', 409, 'SOUND_LIMIT'))
     await runBridgeSyncSounds(t.rt, t.command)
     const content = t.replies.at(-1)!.content
-    expect(content).toContain('Harmony allows 48 sounds per server.')
+    expect(content).toContain('horn: the Harmony soundboard is full (48 sounds per server)')
+    expect(content).not.toContain('SOUND_LIMIT')
     expect(content).toContain('⚠️ Soundboard sync finished with 1 failure(s)')
     expect(content).not.toContain('✅')
   })

@@ -1048,7 +1048,16 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
   const deletions = [...plan.delete, ...plan.replace.flatMap(r => r.harmony)]
   const creations = [...plan.add, ...plan.replace.map(r => r.discord)]
   if (deletions.length + creations.length + plan.update.length === 0) {
-    await command.editReply({ content: '✅ Soundboard already matches.' })
+    // Add mode can leave skipped or outdated sounds behind; say so instead of "matches".
+    const left = plan.skip.length + plan.outdated > 0
+    await command.editReply({
+      content: left
+        ? joinLinesWithinDiscordLimit([
+          `✅ Nothing to add (${mode}) for **${guild.name}**`,
+          ...syncReportLines(plan, { ...reportOpts, dryRun: false }),
+        ])
+        : '✅ Soundboard already matches.',
+    })
     return
   }
 
@@ -1062,25 +1071,25 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
 
   const failures: string[] = []
   const fail = (name: string, err: unknown) => {
-    const hint = err instanceof HarmonyHttpError && err.code === 'SOUND_LIMIT' ? ' (Harmony allows 48 sounds per server.)' : ''
-    failures.push(`${name}: ${errorText(err)}${hint}`)
+    const full = err instanceof HarmonyHttpError && err.code === 'SOUND_LIMIT'
+    failures.push(`${name}: ${full ? 'the Harmony soundboard is full (48 sounds per server)' : errorText(err)}`)
   }
-  const counts = { deleted: 0, created: 0, updated: 0 }
+  const counts = { deleted: 0, created: 0, updated: 0, replaced: 0 }
   const applied: DesiredSound[] = []
 
+  // Resolves to the error, or null once the sound is gone (404 counts as gone).
   const tryDelete = async (h: { id: string }): Promise<unknown> => {
     try {
       await rt.harmony.deleteServerSound(serverId, h.id)
-      counts.deleted++
     } catch (err) {
-      if (err instanceof HarmonyHttpError && err.status === 404) counts.deleted++
-      else return err
+      if (!(err instanceof HarmonyHttpError && err.status === 404)) return err
     }
     return null
   }
   for (const h of plan.delete) {
     const err = await tryDelete(h)
     if (err) fail(h.name, err)
+    else counts.deleted++
   }
   // A replaced sound is only recreated on Discord's name if every old Harmony row is gone.
   const blocked = new Set<string>()
@@ -1095,11 +1104,13 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
       failures.push(`${r.discord.name}: not replaced, deleting the Harmony sound failed: ${errorText(deleteError)}`)
     }
   }
+  const replacing = new Set(plan.replace.map(r => r.discord.id))
   for (const d of creations) {
     if (blocked.has(d.id)) continue
     try {
       await rt.harmony.importDiscordSound(serverId, d, false)
-      counts.created++
+      if (replacing.has(d.id)) counts.replaced++
+      else counts.created++
       applied.push(d)
     } catch (err) {
       fail(d.name, err)
@@ -1121,7 +1132,10 @@ export async function runBridgeSyncSounds(rt: BridgeRuntime, command: ChatInputC
       : `✅ Soundboard sync (${mode}) for **${guild.name}**`,
     `• Added: ${counts.created}`,
     `• Updated: ${counts.updated}`,
+    ...(plan.replace.length > 0 ? [`• Replaced (same name on Harmony): ${counts.replaced}`] : []),
     `• Deleted: ${counts.deleted}`,
+    ...(plan.skip.length > 0 ? [`• Skipped (name already on Harmony): ${plan.skip.length}`] : []),
+    ...(plan.outdated > 0 ? [`• Not updated (add mode): ${plan.outdated}; use merge or mirror to update`] : []),
   ]
   const noEmoji = applied.filter(d => d.hadUnimportedEmoji).length
   if (noEmoji > 0) {

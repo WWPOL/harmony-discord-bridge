@@ -31,7 +31,8 @@ describe('planSync', () => {
     }
     const p = run('add', [d('1', 'a')], harmony)
     expect(p.update).toHaveLength(0)
-    expect(p.unchanged).toBe(1)
+    expect(p.unchanged).toBe(0)
+    expect(p.outdated).toBe(1)
   })
 
   it('counts identical linked items as unchanged', () => {
@@ -100,8 +101,15 @@ describe('planSync', () => {
 })
 
 describe('syncReportLines', () => {
+  it('reports outdated add-mode items and does not call that a match', () => {
+    const plan = { add: [], update: [], replace: [], skip: [], delete: [], unchanged: 1, outdated: 2 }
+    const dry = syncReportLines(plan, { dryRun: true, label: (n: string) => n, noun: 'sound' })
+    expect(dry).toContain('Not updated (add mode): 2 changed on Discord; use merge or mirror to update')
+    expect(dry.join(' ')).not.toContain('Already matches')
+  })
+
   it('says the Harmony side already matches on an empty dry run only', () => {
-    const empty = { add: [], update: [], replace: [], skip: [], delete: [], unchanged: 3 }
+    const empty = { add: [], update: [], replace: [], skip: [], delete: [], unchanged: 3, outdated: 0 }
     const dry = syncReportLines(empty, { dryRun: true, label: (n: string) => n, noun: 'sound' })
     expect(dry).toContain('Already matches: nothing to change')
     const real = syncReportLines(empty, { dryRun: false, label: (n: string) => n, noun: 'sound' })
