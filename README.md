@@ -288,11 +288,13 @@ history on Discord.
 What is imported: normal messages and replies, with their original time,
 author, edit time, embeds, stickers, mentions, custom emoji and attachments;
 pinned state (up to Harmony's 50 pins per channel; further pins are skipped and
-counted); and threads with their messages (archived private threads only when
-the bot has Manage Threads). Replies are linked to their original afterwards.
+counted); and public threads with their messages. Replies are linked to their original afterwards.
 Authors who have left the server are imported as plain Discord users.
 
-What is skipped: reactions (they are not imported), messages from bots
+What is skipped: private threads (they are never imported, and never relayed
+live either: Harmony has no private threads yet, so everyone in the channel
+could read them; the Manage Threads permission is not needed and does not
+change this), reactions (they are not imported), messages from bots
 (including webhooks), system messages (joins, boosts, pin notices and so on),
 and messages already in Harmony. An import can be re-run or resumed after a
 restart without duplicates.

@@ -2,7 +2,7 @@ import type { Message as DiscordMessage } from 'discord.js'
 import { BridgeApiError, type BridgeApi, type ImportJob, type ImportMessage } from '../v2/BridgeApi.js'
 import { errorText, type Logger } from '../log.js'
 import type { Problem } from '../problems.js'
-import { threadName } from './threadSync.js'
+import { isPrivateThread, threadName } from './threadSync.js'
 
 export type ImportResult = 'done' | 'cancelled' | 'failed' | 'paused'
 
@@ -14,12 +14,16 @@ export interface ImportThreadLike {
   createdAt: Date | null
   archived: boolean | null
   locked: boolean | null
+  /** Discord channel type; private threads (12) are never imported. */
+  type?: number
 }
 
 export interface ThreadListPage {
   threads: ImportThreadLike[]
   /** Opaque cursor for the next page; null when the listing is complete. */
   next: Record<string, unknown> | null
+  /** Private threads left out of this page (they never cross the bridge). */
+  skippedPrivate?: number
 }
 
 export interface HistoryImporterDeps {
@@ -31,12 +35,10 @@ export interface HistoryImporterDeps {
   translate(msg: DiscordMessage): Promise<Omit<ImportMessage, 'thread_id' | 'pinned'> | null>
   /**
    * Threads of a channel: active ones (guild-wide list filtered to the channel), then archived
-   * public, then archived private (skipped without Manage Threads). The cursor is opaque to the
+   * public. Private threads are never listed. The cursor is opaque to the
    * importer and records which list it is in and the `before` timestamp; null starts from the top.
    */
   listThreads(channelId: string, cursor: Record<string, unknown> | null): Promise<ThreadListPage>
-  /** Whether the bot may list private threads of the channel (Manage Threads). */
-  canReadPrivateThreads(channelId: string): boolean
   /** Whether the thread was started from a message of the channel, i.e. a message with the thread's id exists. */
   hasStarterMessage(channelId: string, threadId: string): Promise<boolean>
   /** The Harmony discord_user of the member who started the thread, or null. */
@@ -144,14 +146,12 @@ export class HistoryImporter {
     let fresh = !saved && threadsDone === 0
     let skippedThreads = 0
 
-    if (!this.deps.canReadPrivateThreads(channelId)) {
-      log.warn(`History import ${job.id}: the bot cannot read private threads of ${channelId}; they are skipped`)
-      this.deps.reportProblem({ code: 'private_threads_skipped', params: { discord_channel_id: channelId } })
-    }
+    let skippedPrivate = 0
 
     for (;;) {
       if (signal.aborted) return this.stop(await this.pause(job))
-      const { threads, next } = await this.discordCall(job, signal, () => this.deps.listThreads(channelId, at))
+      const { threads, next, skippedPrivate: privateOnPage } = await this.discordCall(job, signal, () => this.deps.listThreads(channelId, at))
+      skippedPrivate += privateOnPage ?? 0
       if (fresh && next === null) await this.patch(job, { threads_total: threads.length })
       fresh = false
 
@@ -171,13 +171,20 @@ export class HistoryImporter {
         if (signal.aborted) return this.stop(await this.pause(job))
         await this.checkServerState(job, signal)
       }
-      if (!next) return
+      if (!next) {
+        if (skippedPrivate > 0) {
+          log.warn(`History import ${job.id}: left out ${skippedPrivate} private thread(s) of ${channelId}`)
+          this.deps.reportProblem({ code: 'private_threads_skipped', params: { discord_channel_id: channelId, count: String(skippedPrivate) } })
+        }
+        return
+      }
       at = next
       skip = 0
     }
   }
 
   private async importThread(job: ImportJob, signal: AbortSignal, thread: ImportThreadLike): Promise<void> {
+    if (isPrivateThread(thread)) return
     const channelId = job.discord_channel_id
     const hasStarter = await this.discordCall(job, signal, () => this.deps.hasStarterMessage(channelId, thread.id), true)
     const discordUser = await this.deps.threadStarter(thread).catch(() => null) ?? null

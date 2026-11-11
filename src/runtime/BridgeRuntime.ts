@@ -37,7 +37,7 @@ import {
 import { PermissionSync } from '../PermissionSync.js'
 import { PermissionSyncStore } from '../PermissionSyncStore.js'
 import { BoundedMap } from '../utils/BoundedMap.js'
-import { ThreadSync, type ThreadAnchor, type ThreadAuthor } from './threadSync.js'
+import { ThreadSync, isPrivateThread, type ThreadAnchor, type ThreadAuthor } from './threadSync.js'
 import {
   buildDiscordJumpLink,
   formatHarmonyReplyForDiscord,
@@ -1898,6 +1898,7 @@ export class BridgeRuntime {
   /** A new Discord thread under a paired channel gets its Harmony thread at once. */
   private async onDiscordThreadCreate(thread: AnyThreadChannel) {
     if (!thread.parentId) return
+    if (isPrivateThread(thread)) return
     // The bridge's own threads mirror Harmony threads; ThreadSync pairs them as it creates them.
     if (thread.ownerId && thread.ownerId === this.discord?.user?.id) return
     const harmonyChannelId = this.dir.getHarmonyChannel(thread.parentId)
@@ -1982,6 +1983,7 @@ export class BridgeRuntime {
     // itself is bridged (onDiscordThreadCreate, harmonyThreadFor), not these notices.
     if (msg.type === MessageType.ThreadCreated || msg.type === MessageType.ThreadStarterMessage) return
 
+    if (isPrivateThread(msg.channel)) return
     const pairId = this.discordPairId(msg.channelId, msg.channel)
     const harmonyChannelId = this.dir.getHarmonyChannel(pairId)
     if (!harmonyChannelId) return
@@ -2081,6 +2083,7 @@ export class BridgeRuntime {
       }
     }
 
+    if (isPrivateThread(reaction.message.channel)) return
     const harmonyChannelId = this.dir.getHarmonyChannel(this.discordPairId(reaction.message.channelId, reaction.message.channel))
     if (!harmonyChannelId) return
     if (!this.dir.shouldBridgeFromDiscord(this.discordPairId(reaction.message.channelId, reaction.message.channel))) return
@@ -2129,6 +2132,7 @@ export class BridgeRuntime {
       }
     }
 
+    if (isPrivateThread(reaction.message.channel)) return
     const harmonyChannelId = this.dir.getHarmonyChannel(this.discordPairId(reaction.message.channelId, reaction.message.channel))
     if (!harmonyChannelId) return
     if (!this.dir.shouldBridgeFromDiscord(this.discordPairId(reaction.message.channelId, reaction.message.channel))) return
@@ -2161,6 +2165,7 @@ export class BridgeRuntime {
     if (!this.settings().syncEdits) return
     if (!newMsg.author || newMsg.author.bot) return
 
+    if (isPrivateThread(newMsg.channel)) return
     const updatePairId = this.discordPairId(newMsg.channelId, newMsg.channel)
     const harmonyChannelId = this.dir.getHarmonyChannel(updatePairId)
     if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(updatePairId)) return
@@ -2214,6 +2219,7 @@ export class BridgeRuntime {
     if (msg.author?.bot || msg.webhookId) return false
     if (this.harmonyOriginCopies.has(msg.id)) return false
 
+    if (isPrivateThread(msg.channel)) return false
     const deletePairId = this.discordPairId(msg.channelId, msg.channel)
     const harmonyChannelId = this.dir.getHarmonyChannel(deletePairId)
     if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(deletePairId)) return false

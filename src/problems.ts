@@ -24,9 +24,12 @@ export interface Problem {
   params?: Record<string, string>
 }
 
+/** Params that describe a problem without identifying it: a new count replaces the old entry. */
+const UNKEYED_PARAMS = new Set(['count'])
+
 export function problemKey(p: Problem): string {
   const params = p.params
-    ? Object.keys(p.params).sort().map(k => `${k}=${p.params![k]}`).join(',')
+    ? Object.keys(p.params).filter(k => !UNKEYED_PARAMS.has(k)).sort().map(k => `${k}=${p.params![k]}`).join(',')
     : ''
   return `${p.code}${params ? `:${params}` : ''}`
 }
@@ -134,8 +137,8 @@ export function describeProblem(p: Problem): { summary: string; fix: string } {
       }
     case 'private_threads_skipped':
       return {
-        summary: `History import skipped the private threads of ${ch}: the bot cannot read them.`,
-        fix: 'Give the bot the Manage Threads permission on that channel, then import again.',
+        summary: `History import left out ${p.params?.count ? `${p.params.count} private thread(s)` : 'the private threads'} of ${ch}: Harmony has no private threads yet, so everyone in the channel could read them.`,
+        fix: 'Nothing to do. Private threads stay on Discord until Harmony supports them.',
       }
     case 'message_content_needed_for_import':
       return {
