@@ -62,6 +62,7 @@ import { isPublicHttpsUrl } from '../utils/fetchCapped.js'
 import { loadInstanceIcon } from '../utils/instanceIcon.js'
 import { ReactionLedger } from '../utils/reactionLedger.js'
 import { ServerEmojiLinks } from './serverEmojiLinks.js'
+import { ServerStickerLinks } from './serverStickerLinks.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
 import type { FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
@@ -348,6 +349,7 @@ export class BridgeRuntime {
   private readonly reactionLedger = new ReactionLedger()
   /** Harmony server emoji imported from Discord; one emoji on both sides. */
   readonly emojiLinks = new ServerEmojiLinks(serverId => this.harmony.getServerEmojis(serverId))
+  readonly stickerLinks = new ServerStickerLinks(id => this.harmony.getStickerSyncState(id).then(s => s.stickers))
 
   private droppedMessages = 0
   /** Discord messages Harmony's AutoMod refused since start. */
@@ -2630,13 +2632,16 @@ export class BridgeRuntime {
   /** Harmony server of a bridged guild, with its emoji links loaded. */
   private async emojiServerFor(guildId: string | null | undefined): Promise<string | undefined> {
     const serverId = guildId ? this.dir.getBridgeForDiscordGuild(guildId)?.harmonyServerId : undefined
-    if (serverId) await this.emojiLinks.ensure(serverId)
+    if (serverId) await Promise.all([this.emojiLinks.ensure(serverId), this.stickerLinks.ensure(serverId)])
     return serverId
   }
 
   private async refreshEmojiLinks(): Promise<void> {
     for (const bridge of this.dir.getBridges()) {
-      if (bridge.harmonyServerId) await this.emojiLinks.ensure(bridge.harmonyServerId)
+      if (bridge.harmonyServerId) {
+        await this.emojiLinks.ensure(bridge.harmonyServerId)
+        await this.stickerLinks.ensure(bridge.harmonyServerId)
+      }
     }
   }
 
