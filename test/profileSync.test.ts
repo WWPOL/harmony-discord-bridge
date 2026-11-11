@@ -16,6 +16,16 @@ describe('planProfileSync', () => {
     expect(act(disc({ name: ' Srv ' }), harm({ name: 'Srv' }), 'name')).toBe('same')
   })
 
+  it('hash match with null icon_path is replace', () => {
+    const p = planProfileSync(
+      disc({ icon: 'abc' }),
+      harm({ icon: 'https://h/i.png', icon_discord_hash: 'abc', icon_path: null }),
+      only('icon'),
+    )
+    expect(p.fields[0]!.action).toBe('replace')
+    expect(p.body).toEqual({ icon_hash: 'abc' })
+  })
+
   it('renamed server is replace with body.name', () => {
     const p = planProfileSync(disc({ name: 'New' }), harm({ name: 'Old' }), only('name'))
     expect(p.fields).toEqual([{ field: 'name', action: 'replace', from: 'Old', to: 'New' }])

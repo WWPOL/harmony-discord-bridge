@@ -121,6 +121,30 @@ describe('runBridgeSyncProfile', () => {
     expect(last(t)).toContain('• Removed: icon')
   })
 
+  it('guild.fetch failure replies Could not read the Discord server', async () => {
+    const t = setup({ fetchError: new Error('boom') })
+    await runBridgeSyncProfile(t.rt, t.command)
+    expect(last(t)).toContain('❌ Could not read the Discord server:')
+    expect(last(t)).toContain('boom')
+    expect(t.rt.harmony.syncServerProfile).not.toHaveBeenCalled()
+  })
+
+  it('changed false after Confirm replies already matched; nothing written', async () => {
+    const t = setup()
+    t.rt.harmony.syncServerProfile.mockResolvedValue({ changed: false, name: 'New', description: null, icon: null, banner: null })
+    await runBridgeSyncProfile(t.rt, t.command)
+    expect(last(t)).toBe('✅ **New**: Harmony already matched Discord; nothing written.')
+  })
+
+  it('not bridged replies notBridgedText', async () => {
+    const t = setup()
+    t.rt.dir.getBridgeForDiscordGuild = () => null
+    await runBridgeSyncProfile(t.rt, t.command)
+    expect(last(t)).toMatch(/bridge/i)
+    expect(t.rt.harmony.getServerProfileSyncState).not.toHaveBeenCalled()
+    expect(t.message.awaitMessageComponent).not.toHaveBeenCalled()
+  })
+
   it('404 on state says Harmony is too old', async () => {
     const t = setup({ harmony: new HarmonyHttpError('nf', 404) })
     await runBridgeSyncProfile(t.rt, t.command)

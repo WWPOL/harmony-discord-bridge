@@ -33,7 +33,7 @@ import {
   PROFILE_FIELDS, planProfileSync, profilePlanLines, profileSkipLines,
   type DiscordProfile, type ProfileField,
 } from './profileSync.js'
-import { desiredSound,harmonySyncItem, soundDiffers, type DesiredSound } from './soundSync.js'
+import { desiredSound, harmonySyncItem, soundDiffers, type DesiredSound } from './soundSync.js'
 
 // =============================================================================
 // Command definitions
