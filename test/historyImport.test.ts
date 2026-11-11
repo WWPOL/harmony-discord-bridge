@@ -61,6 +61,7 @@ function setup(opts: {
   starters?: Set<string>
   /** Private threads each listing page reports as filtered out. */
   skippedPrivate?: number[]
+  listThreads?: (channel: string, cursor: Record<string, unknown> | null) => Promise<any>
 } = {}) {
   const all = opts.all ?? []
   const patches: Array<Record<string, unknown>> = []
@@ -80,11 +81,11 @@ function setup(opts: {
   const fetchPage = vi.fn((channel: string, before: string | undefined) =>
     (threadPagers.get(channel) ?? channelPager)(channel, before))
   const threadPages = opts.threadPages ?? []
-  const listThreads = vi.fn(async (_channel: string, cursor: Record<string, unknown> | null) => {
+  const listThreads = vi.fn(opts.listThreads ?? (async (_channel: string, cursor: Record<string, unknown> | null) => {
     const page = typeof cursor?.page === 'number' ? cursor.page : 0
     const threads = threadPages[page] ?? []
     return { threads, next: page + 1 < threadPages.length ? { page: page + 1 } : null, skippedPrivate: opts.skippedPrivate?.[page] }
-  })
+  }))
   const reportProblem = vi.fn()
   const sleeps: number[] = []
   const importer = new HistoryImporter({
@@ -293,6 +294,21 @@ const thread = (id: string, over: Record<string, any> = {}) => ({
 const threadMsgs = (base: number, n: number) => history(n, i => ({ id: SNOW(base + i) })).map((m: any, k: number) => ({ ...m, id: SNOW(base + n - k) }))
 
 describe('HistoryImporter threads and replies phases', () => {
+  it('finishes a voice channel import: its thread listing ends after the active list', async () => {
+    const { ChannelType } = await import('discord.js')
+    const { discordImportAccess } = await import('../src/runtime/importDiscord.js')
+    const voice: any = {
+      id: 'c1', type: ChannelType.GuildVoice, messages: {},
+      guild: { channels: { fetchActiveThreads: async () => ({ threads: new Map() }) } },
+    }
+    const access = discordImportAccess(() => ({ channels: { cache: new Map([['c1', voice]]), fetch: async () => voice } }) as any)
+    const { importer, patches, posts, j } = setup({ all: history(3), listThreads: (c, cur) => access.listThreads(c, cur) })
+    expect(await importer.run(j, new AbortController().signal)).toBe('done')
+    expect(posts.flat()).toHaveLength(3)
+    expect(patches.at(-1)).toEqual({ state: 'done' })
+    expect(patches.some(p => p.state === 'paused')).toBe(false)
+  })
+
   const T1 = SNOW(500)
   const T2 = SNOW(600)
 

@@ -62,6 +62,14 @@ describe('discordImportAccess.fetchPage', () => {
 })
 
 describe('discordImportAccess.fetchPins', () => {
+  it('answers no pins for a channel type that rejects the endpoint, but rethrows other errors', async () => {
+    const { channel, access } = setup()
+    channel.messages = { fetchPins: vi.fn().mockRejectedValueOnce(discordError(50024, 'Cannot execute action on this channel type')) }
+    expect(await access.fetchPins('c1')).toEqual(new Set())
+    channel.messages = { fetchPins: vi.fn().mockRejectedValueOnce(discordError(50013, 'Missing Permissions')) }
+    await expect(access.fetchPins('c1')).rejects.toMatchObject({ code: 50013 })
+  })
+
   it('collects pinned ids across pages', async () => {
     const { channel, access } = setup()
     channel.messages = {
@@ -75,6 +83,18 @@ describe('discordImportAccess.fetchPins', () => {
 })
 
 describe('discordImportAccess threads', () => {
+  it.each([['voice', ChannelType.GuildVoice], ['stage', ChannelType.GuildStageVoice]])(
+    'ends the listing after the active list in a %s channel, which has no thread manager',
+    async (_name, type) => {
+      const { channel, access } = setup({ active: [thread('11', 'c1', null), thread('99', 'other', null)] })
+      channel.type = type
+      delete channel.threads
+      const first = await access.listThreads('c1', null)
+      expect(first.threads.map(t => t.id)).toEqual(['11'])
+      expect(first.next).toBeNull()
+    },
+  )
+
   it('lists active threads of the channel only, newest first, then moves to archived public', async () => {
     const { access } = setup({
       active: [thread('11', 'c1', null), thread('13', 'c1', null), thread('99', 'other', null), thread('12', 'c1', null)],
