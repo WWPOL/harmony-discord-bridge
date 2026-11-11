@@ -230,6 +230,8 @@ export class ImportScheduler {
     if (count >= STALL_LIMIT) {
       log?.warn(`History import ${id}: no progress after ${count} pauses, failing it`)
       try {
+        // Harmony only lets a running job fail; a paused one goes back to running first.
+        if (latest.state === 'paused') await api.updateImport(id, { state: 'running' })
         await api.updateImport(id, { state: 'failed', error: 'bridge_stalled' })
         this.forget(id)
         return false
