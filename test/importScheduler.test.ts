@@ -190,7 +190,14 @@ describe('ImportScheduler', () => {
 
   it('fails a job as bridge_stalled after 3 pauses without progress', async () => {
     const jobs = [job('a', { state: 'paused', reached_discord_message_id: '5' })]
-    const updateImport = vi.fn(async () => job('a'))
+    // Harmony's rule: a paused job may only go back to running; running may go to failed.
+    const updateImport = vi.fn(async (_id: string, patch: Partial<ImportJob>) => {
+      const from = jobs[0].state
+      const ok = (from === 'paused' && patch.state === 'running') || (from === 'running' && patch.state === 'failed')
+      if (!ok) throw new Error(`PATCH /bridge/v2/imports/:id failed (409 invalid_transition)`)
+      jobs[0] = { ...jobs[0], state: patch.state! }
+      return jobs[0]
+    })
     const { scheduler, calls } = make(() => jobs, { api: { listImports: vi.fn(async () => jobs), updateImport } })
     scheduler.start()
     for (let n = 1; n <= 3; n++) {
@@ -199,7 +206,8 @@ describe('ImportScheduler', () => {
       calls[n - 1].release('paused')
       if (n < 3) { await vi.waitFor(() => expect(updateImport).not.toHaveBeenCalled()); await new Promise(r => setTimeout(r, 5)); scheduler.kick() }
     }
-    await vi.waitFor(() => expect(updateImport).toHaveBeenCalledWith('a', { state: 'failed', error: 'bridge_stalled' }))
+    await vi.waitFor(() => expect(jobs[0].state).toBe('failed'))
+    expect(updateImport.mock.calls).toEqual([['a', { state: 'running' }], ['a', { state: 'failed', error: 'bridge_stalled' }]])
     await scheduler.stop()
   })
 
