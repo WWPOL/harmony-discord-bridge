@@ -59,7 +59,8 @@ function setup(opts: {
   threadPages?: any[][]
   threadMessages?: Record<string, any[]>
   starters?: Set<string>
-  canPrivate?: boolean
+  /** Private threads each listing page reports as filtered out. */
+  skippedPrivate?: number[]
 } = {}) {
   const all = opts.all ?? []
   const patches: Array<Record<string, unknown>> = []
@@ -82,7 +83,7 @@ function setup(opts: {
   const listThreads = vi.fn(async (_channel: string, cursor: Record<string, unknown> | null) => {
     const page = typeof cursor?.page === 'number' ? cursor.page : 0
     const threads = threadPages[page] ?? []
-    return { threads, next: page + 1 < threadPages.length ? { page: page + 1 } : null }
+    return { threads, next: page + 1 < threadPages.length ? { page: page + 1 } : null, skippedPrivate: opts.skippedPrivate?.[page] }
   })
   const reportProblem = vi.fn()
   const sleeps: number[] = []
@@ -96,7 +97,6 @@ function setup(opts: {
       reply_to_discord_message_id: null,
     })),
     listThreads,
-    canReadPrivateThreads: vi.fn(() => opts.canPrivate ?? true),
     hasStarterMessage: vi.fn(async (_c: string, threadId: string) => opts.starters?.has(threadId) ?? false),
     threadStarter: vi.fn(async (t: any) => (t.ownerId ? { id: t.ownerId } : null)),
     reportProblem,
@@ -403,17 +403,24 @@ describe('HistoryImporter threads and replies phases', () => {
     expect(patches).toEqual([{ state: 'running' }, { state: 'done' }])
   })
 
-  it('raises private_threads_skipped without Manage Threads', async () => {
-    const { importer, reportProblem, j } = setup({ all: [], canPrivate: false, threadPages: [[thread(T1)]] })
+  it('raises private_threads_skipped once, with the count summed over pages', async () => {
+    const { importer, reportProblem, j } = setup({ all: [], threadPages: [[thread(T1)], [thread(T2)]], skippedPrivate: [2, 1] })
     await importer.run(j, new AbortController().signal)
     expect(reportProblem).toHaveBeenCalledTimes(1)
-    expect(reportProblem).toHaveBeenCalledWith({ code: 'private_threads_skipped', params: { discord_channel_id: '1001' } })
+    expect(reportProblem).toHaveBeenCalledWith({ code: 'private_threads_skipped', params: { discord_channel_id: '1001', count: '3' } })
   })
 
-  it('raises no problem when private threads are readable', async () => {
-    const { importer, reportProblem, j } = setup({ all: [], canPrivate: true })
+  it('raises no problem when no private threads were left out', async () => {
+    const { importer, reportProblem, j } = setup({ all: [], threadPages: [[thread(T1)]], skippedPrivate: [0] })
     await importer.run(j, new AbortController().signal)
     expect(reportProblem).not.toHaveBeenCalled()
+  })
+
+  it('never imports a private thread handed to it', async () => {
+    const { importer, api, j } = setup({ all: [], threadPages: [[thread(T1, { type: 12 }), thread(T2)]] })
+    await importer.run(j, new AbortController().signal)
+    expect(api.importThread).toHaveBeenCalledTimes(1)
+    expect(api.importThread.mock.calls[0][1]).toMatchObject({ discord_thread_id: T2 })
   })
 
   it('calls linkImportReplies once, then patches done', async () => {

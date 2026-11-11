@@ -134,8 +134,8 @@ export function describeProblem(p: Problem): { summary: string; fix: string } {
       }
     case 'private_threads_skipped':
       return {
-        summary: `History import skipped the private threads of ${ch}: the bot cannot read them.`,
-        fix: 'Give the bot the Manage Threads permission on that channel, then import again.',
+        summary: `History import left out ${p.params?.count ? `${p.params.count} private thread(s)` : 'the private threads'} of ${ch}: Harmony has no private threads yet, so everyone in the channel could read them.`,
+        fix: 'Nothing to do. Private threads stay on Discord until Harmony supports them.',
       }
     case 'message_content_needed_for_import':
       return {
