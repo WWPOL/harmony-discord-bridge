@@ -81,6 +81,15 @@ describe('planSync', () => {
     expect(m.delete.map(x => x.id)).toEqual(['H2'])
   })
 
+  it('merge drops a clashing restore before the limit, so it cannot push a real add over', () => {
+    const harmony = [h('A', 'other', '9'), rm('R', 'old', '1'), h('U', 'back')]
+    const p = run('merge', [d('9', 'other'), d('1', 'back'), d('2', 'fresh')], harmony, undefined, 3)
+    expect(p.restore).toEqual([])
+    expect(p.conflict.map(c => [c.discord.id, c.harmony.map(x => x.id)])).toEqual([['1', ['U']]])
+    expect(p.add.map(x => x.id)).toEqual(['2'])
+    expect(p.overLimit).toEqual([])
+  })
+
   it('mirror deletes Harmony-only and stale-linked items; merge and add delete nothing', () => {
     const harmony = [h('H1', 'only'), h('H2', 'stale', '999'), h('H3', 'kept', '1')]
     const p = run('mirror', [d('1', 'kept')], harmony)
@@ -131,7 +140,7 @@ describe('syncReportLines', () => {
   it('reports outdated add-mode items and does not call that a match', () => {
     const plan = { add: [], update: [], replace: [], conflict: [], delete: [], unchanged: 1, outdated: 2 }
     const dry = syncReportLines(plan, { dryRun: true, label: (n: string) => n, noun: 'sound' })
-    expect(dry).toContain('Not updated (add mode): 2 changed on Discord; use merge or mirror to update')
+    expect(dry).toContain('Not updated (add mode): 2; use merge or mirror to update')
     expect(dry.join(' ')).not.toContain('Already matches')
   })
 
@@ -214,7 +223,7 @@ describe('planSync restore and limit', () => {
   it('merge reports an unlinked holder of a restored item name', () => {
     const harmony = [rm('H1', 'old', '1'), h('H2', 'new')]
     const p = run('merge', [d('1', 'new')], harmony)
-    expect(p.restore.map(r => r.harmony.id)).toEqual(['H1'])
+    expect(p.restore).toEqual([])
     expect(p.conflict.map(c => [c.discord.id, c.harmony.map(x => x.id)])).toEqual([['1', ['H2']]])
   })
 
@@ -247,6 +256,16 @@ describe('planSync restore and limit', () => {
       expect(p.overLimit).toHaveLength(0)
       expect(p.limit).toBe(0)
     }
+  })
+})
+
+describe('syncReportLines removeVerb', () => {
+  it('uses the given verbs for the delete section', () => {
+    const plan = run('mirror', [], [h('H1', 'x')])
+    const base = { label: (n: string) => n, noun: 'emoji' }
+    expect(syncReportLines(plan, { ...base, dryRun: true, removeVerb: { dry: 'Would remove', real: 'Remove' } })[0]).toBe('Would remove 1 emoji')
+    expect(syncReportLines(plan, { ...base, dryRun: false, removeVerb: { dry: 'Would remove', real: 'Remove' } })[0]).toBe('Remove 1 emoji')
+    expect(syncReportLines(plan, { ...base, dryRun: true })[0]).toBe('Would delete 1 emoji')
   })
 })
 

@@ -1238,7 +1238,7 @@ export async function runBridgeSyncEmojis(
     restore: rawPlan.restore.filter(u => !clashing.has(u.discord.id)),
   }
   const limitHint = '  An instance admin can raise "max custom emojis per server", then run this again.'
-  const reportOpts = { label: (n: string) => `:${n}:`, noun: 'emoji', nounPlural: 'emoji', limitHint }
+  const reportOpts = { label: (n: string) => `:${n}:`, noun: 'emoji', nounPlural: 'emoji', limitHint, removeVerb: { dry: 'Would remove', real: 'Remove' } }
 
   if (dryRun) {
     await command.editReply({
