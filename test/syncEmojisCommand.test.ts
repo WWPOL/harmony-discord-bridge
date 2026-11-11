@@ -95,6 +95,7 @@ describe('runBridgeSyncEmojis', () => {
     await runBridgeSyncEmojis(t.rt, t.command)
     expect(t.calls).toEqual(['remove:h1', 'create:horn'])
     expect(last(t)).toContain('• Replaced (same name on Harmony): 1')
+    expect(last(t)).toContain('• Removed: 0')
   })
 
   it('a failed holder removal blocks the create', async () => {
@@ -201,6 +202,7 @@ describe('runBridgeSyncEmojis', () => {
   it('lets a 403 propagate', async () => {
     const t = setup({ harmony: new HarmonyHttpError('forbidden', 403) })
     await expect(runBridgeSyncEmojis(t.rt, t.command)).rejects.toThrow('forbidden')
+    expect(t.rt.harmony.importDiscordEmoji).not.toHaveBeenCalled()
   })
 
   it('writes nothing on a dry run', async () => {

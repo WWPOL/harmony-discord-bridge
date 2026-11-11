@@ -1308,7 +1308,6 @@ export async function runBridgeSyncEmojis(
     for (const h of r.harmony) {
       const err = await tryRemove(h)
       if (err) removeError ??= err
-      else counts.removed++
     }
     if (removeError) {
       blocked.add(r.discord.id)
