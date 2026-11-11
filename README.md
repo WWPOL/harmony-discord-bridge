@@ -285,6 +285,8 @@ The channel's pair must bring Discord messages to Harmony (direction "both" or
 needs the **Message Content** intent and permission to read the channel's
 history on Discord.
 
+Voice and stage channels import their text chat too (they have no threads).
+
 What is imported: normal messages and replies, with their original time,
 author, edit time, embeds, stickers, mentions, custom emoji and attachments;
 pinned state (up to Harmony's 50 pins per channel; further pins are skipped and

@@ -1,10 +1,12 @@
 import type { Client, Message as DiscordMessage } from 'discord.js'
-import { isPrivateThread } from './threadSync.js'
+import { isPrivateThread, supportsThreads } from './threadSync.js'
 import type { ImportThreadLike, ThreadListPage } from './historyImport.js'
 
 /** Discord REST: unknown channel / unknown message. */
 const UNKNOWN_CHANNEL = 10003
 const UNKNOWN_MESSAGE = 10008
+/** Discord REST: cannot execute action on this channel type. */
+const WRONG_CHANNEL_TYPE = 50024
 
 const byIdDesc = (a: { id: string }, b: { id: string }) => (BigInt(a.id) < BigInt(b.id) ? 1 : BigInt(a.id) > BigInt(b.id) ? -1 : 0)
 
@@ -71,7 +73,14 @@ export function discordImportAccess(getClient: () => Client | null): DiscordImpo
       const pins = new Set<string>()
       let before: Date | undefined
       for (;;) {
-        const res = await channel.messages.fetchPins(before ? { before } : {})
+        let res
+        try {
+          res = await channel.messages.fetchPins(before ? { before } : {})
+        } catch (err) {
+          // A channel type without pins has none to import; any other error is real.
+          if (discordCode(err) === WRONG_CHANNEL_TYPE) return pins
+          throw err
+        }
         for (const item of res.items) pins.add(item.message.id)
         const last = res.items[res.items.length - 1]
         if (!res.hasMore || !last) break
@@ -94,10 +103,13 @@ export function discordImportAccess(getClient: () => Client | null): DiscordImpo
         const threads = inChannel.filter(t => !isPrivateThread(t)).sort(byIdDesc)
         return {
           threads: threads as ImportThreadLike[],
-          next: { list: 'public', before: null },
+          next: supportsThreads(channel) ? { list: 'public', before: null } : null,
           skippedPrivate: inChannel.length - threads.length,
         }
       }
+
+      // A job saved mid-listing before voice and stage channels were recognised resumes here.
+      if (!supportsThreads(channel)) return { threads: [], next: null }
 
       const res = await channel.threads.fetchArchived({
         type: 'public',
