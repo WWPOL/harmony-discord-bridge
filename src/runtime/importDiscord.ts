@@ -108,6 +108,9 @@ export function discordImportAccess(getClient: () => Client | null): DiscordImpo
         }
       }
 
+      // A job saved mid-listing before voice and stage channels were recognised resumes here.
+      if (!supportsThreads(channel)) return { threads: [], next: null }
+
       const res = await channel.threads.fetchArchived({
         type: 'public',
         limit: 100,

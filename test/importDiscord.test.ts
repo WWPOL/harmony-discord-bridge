@@ -95,6 +95,14 @@ describe('discordImportAccess threads', () => {
     },
   )
 
+  it('ends a resumed archived listing in a voice channel without calling Discord', async () => {
+    const { channel, access } = setup({})
+    channel.type = ChannelType.GuildVoice
+    delete channel.threads
+    const page = await access.listThreads('c1', { list: 'public', before: '2024-01-01T00:00:00.000Z' })
+    expect(page).toEqual({ threads: [], next: null })
+  })
+
   it('lists active threads of the channel only, newest first, then moves to archived public', async () => {
     const { access } = setup({
       active: [thread('11', 'c1', null), thread('13', 'c1', null), thread('99', 'other', null), thread('12', 'c1', null)],
