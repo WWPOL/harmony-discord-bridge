@@ -114,6 +114,15 @@ describe('Discord stickers synced to Harmony', () => {
     expect(rt.discordToHarmonyMessages.get('dm-1')).toBe('hm-new')
   })
 
+  it('a new message with a retired sticker link is sent as the image', async () => {
+    const { rt, h } = await setup()
+    rt.stickerLinks.replace('s', [row({ removed: true })])
+    await rt.onDiscordMessage(discordMessage())
+    expect(h.sendMessage).toHaveBeenCalledTimes(1)
+    expect(hasSticker(h.sendMessage.mock.calls[0][1])).toBe(false)
+    expect(h.sendMessage.mock.calls[0][1]).toContainEqual(IMAGE)
+  })
+
   it('an edit of a message whose sticker was retired keeps the native part', async () => {
     const { rt, h } = await setup()
     rt.stickerLinks.replace('s', [row({ removed: true })])

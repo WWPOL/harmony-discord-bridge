@@ -1697,12 +1697,15 @@ export class BridgeRuntime {
   }
 
   /** Translation context for Discord → Harmony. */
-  private discordToHarmonyContext(serverId?: string): DiscordToHarmonyContext {
+  private discordToHarmonyContext(serverId?: string, forNewMessage = false): DiscordToHarmonyContext {
     return {
       harmonyEmojiFor: discordEmojiId => this.linkedHarmonyEmoji(discordEmojiId, serverId),
-      // The message's own server only; retired rows answer too so an edit keeps its sticker part.
+      // The message's own server only; retired rows answer only for an edit, which keeps its sticker part.
       harmonyStickerFor: serverId
-        ? discordStickerId => this.stickerLinks.harmonyFor(serverId, discordStickerId)
+        ? discordStickerId => {
+          const link = this.stickerLinks.harmonyFor(serverId, discordStickerId)
+          return forNewMessage && link?.removed ? null : link
+        }
         : undefined,
       harmonyRoleFor: id => this.permissionSyncStore.getHarmonyRoleId(id),
       harmonyDefaultRoleId: this.permissionSyncStore.getDefaultHarmonyRoleId(),
@@ -1942,7 +1945,7 @@ export class BridgeRuntime {
 
       // Attachment storage policy (link/refresh/mirror) is applied by the bot-gateway.
       const stickerServerId = await this.emojiServerFor(msg.guildId)
-      const buildParts = () => this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(stickerServerId), { content: cleanedContent })
+      const buildParts = () => this.translator.discordToHarmonyParts(msg, this.discordToHarmonyContext(stickerServerId, true), { content: cleanedContent })
       if (buildParts().length === 0) {
         this.log.debug(`Discord message ${msg.id} has nothing to bridge`)
         return

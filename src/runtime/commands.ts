@@ -1524,21 +1524,29 @@ export async function runBridgeSyncStickers(rt: BridgeRuntime, command: ChatInpu
   }
 
   const failures: string[] = []
-  const fail = (d: { name: string }, err: unknown) => {
+  const fail = (d: { name: string }, err: unknown, afterRemoval = false) => {
+    let fileReason: string | null = null
     if (err instanceof HarmonyHttpError && err.status === 422 && err.code === 'STICKER_FILE') {
       const reason = String(err.details.reason ?? '')
-      fileSkips.push({ name: d.name, reason: STICKER_FILE_REASONS[reason] ?? (reason || errorText(err)) })
-      return
+      fileReason = STICKER_FILE_REASONS[reason] ?? (reason || errorText(err))
+      if (!afterRemoval) {
+        fileSkips.push({ name: d.name, reason: fileReason })
+        return
+      }
     }
     let text: string
-    if (err instanceof HarmonyHttpError && err.code === 'STICKER_LIMIT') {
+    if (fileReason !== null) {
+      text = fileReason
+    } else if (err instanceof HarmonyHttpError && err.code === 'STICKER_LIMIT') {
       text = `the Harmony sticker list is full (${state.limit} per server)`
     } else if (err instanceof HarmonyHttpError && err.code === 'STICKER_NAME_TAKEN') {
       text = 'name already used by another Harmony sticker'
     } else {
       text = errorText(err)
     }
-    failures.push(`"${d.name}": ${text}`)
+    failures.push(afterRemoval
+      ? `"${d.name}": the Harmony sticker was removed but the Discord one could not be copied (${text})`
+      : `"${d.name}": ${text}`)
   }
   const counts = { removed: 0, created: 0, updated: 0, restored: 0, replaced: 0 }
 
@@ -1575,7 +1583,7 @@ export async function runBridgeSyncStickers(rt: BridgeRuntime, command: ChatInpu
       if (replacing.has(d.id)) counts.replaced++
       else counts.created++
     } catch (err) {
-      fail(d, err)
+      fail(d, err, replacing.has(d.id))
     }
   }
   for (const { discord: d } of plan.update) {

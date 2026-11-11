@@ -163,6 +163,30 @@ describe('runBridgeSyncStickers', () => {
     expect(text).not.toContain('failure')
   })
 
+  it('a mirror replace whose create is file-refused is a failure naming the removal', async () => {
+    const t = setup({ discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn')] })
+    t.rt.harmony.importDiscordSticker.mockRejectedValue(
+      new HarmonyHttpError('bad file', 422, 'STICKER_FILE', { reason: 'duration' }),
+    )
+    await runBridgeSyncStickers(t.rt, t.command)
+    const text = last(t)
+    expect(t.rt.harmony.removeServerSticker).toHaveBeenCalledWith('s1', 'h1')
+    expect(text.startsWith('⚠️')).toBe(true)
+    expect(text).toContain('1 failure(s)')
+    expect(text).toContain('"horn": the Harmony sticker was removed but the Discord one could not be copied (animation over 5 s)')
+    expect(text).not.toContain("can't be copied (")
+  })
+
+  it('a mirror replace whose create gets a 409 is a failure naming the removal', async () => {
+    const t = setup({ discord: [dSticker('1', 'horn')], harmony: [hRow('h1', 'horn')] })
+    t.rt.harmony.importDiscordSticker.mockRejectedValue(new HarmonyHttpError('conflict here', 409))
+    await runBridgeSyncStickers(t.rt, t.command)
+    const text = last(t)
+    expect(text.startsWith('⚠️')).toBe(true)
+    expect(text).toContain('"horn": the Harmony sticker was removed but the Discord one could not be copied (')
+    expect(text).toContain('conflict here')
+  })
+
   it('creates what fits under the limit and lists the rest', async () => {
     const t = setup({
       mode: 'add',
