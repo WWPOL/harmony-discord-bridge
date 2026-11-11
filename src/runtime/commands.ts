@@ -947,7 +947,7 @@ async function runBridgeImportEmojis(rt: BridgeRuntime, command: ChatInputComman
     return
   }
 
-  const counts = { created: 0, linked: 0, existing: emojis.length - fresh.length }
+  const counts = { created: 0, linked: 0, updated: 0, existing: emojis.length - fresh.length }
   const failures: string[] = []
   for (const emoji of fresh) {
     try {
