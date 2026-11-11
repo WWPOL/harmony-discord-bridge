@@ -9,6 +9,9 @@ describe('stickerSync mapping', () => {
   it('desiredSticker strips control characters, trims, cuts names to 30 code points', () => {
     const d = desiredSticker({ ...base, name: '  wa\u0000v\u0007e\n ' })
     expect(d).toEqual({ id: '1', name: 'wave', description: 'hi', formatType: 1 })
+    expect((desiredSticker({ ...base, name: 'a\u007fb\u0085c' }) as any).name).toBe('abc')
+    const spaced = desiredSticker({ ...base, name: 'a'.repeat(29) + ' ' + 'x'.repeat(10) }) as any
+    expect(spaced.name).toBe('a'.repeat(29))
     const long = desiredSticker({ ...base, name: '😀'.repeat(40) })
     expect(isStickerSkip(long)).toBe(false)
     expect(Array.from((long as any).name)).toHaveLength(30)

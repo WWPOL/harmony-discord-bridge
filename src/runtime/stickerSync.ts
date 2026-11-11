@@ -34,7 +34,8 @@ export function isStickerSkip(x: DesiredSticker | StickerSkip): x is StickerSkip
 
 export function desiredSticker(s: DiscordStickerInput): DesiredSticker | StickerSkip {
   // eslint-disable-next-line no-control-regex
-  const name = cut((s.name ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim(), NAME_MAX)
+  // Trim again after the cut: Harmony stores btrim(name), so a trailing space would never match.
+  const name = cut((s.name ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim(), NAME_MAX).trim()
   if (s.formatType === LOTTIE) return { id: s.id, name, reason: 'lottie' }
   if (Array.from(name).length < 2) return { id: s.id, name, reason: 'name' }
   const description = cut((s.description ?? '').trim(), DESCRIPTION_MAX).trim() || name
