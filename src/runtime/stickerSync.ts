@@ -42,8 +42,8 @@ export function desiredSticker(s: DiscordStickerInput): DesiredSticker | Sticker
   return { id: s.id, name, description, formatType: s.formatType }
 }
 
-export function harmonyStickerSyncItem(r: HarmonyStickerSyncRow): SyncHarmonyItem {
-  return { id: r.id, name: r.name, discordId: r.discord_sticker_id, removed: r.removed }
+export function harmonyStickerSyncItem(r: HarmonyStickerSyncRow): SyncHarmonyItem & { description: string } {
+  return { id: r.id, name: r.name, description: r.description, discordId: r.discord_sticker_id, removed: r.removed }
 }
 
 export function stickerDiffers(d: DesiredSticker, h: { name: string; description: string }): boolean {

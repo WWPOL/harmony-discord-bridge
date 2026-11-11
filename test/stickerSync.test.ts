@@ -44,7 +44,7 @@ describe('stickerSync mapping', () => {
 
   it('harmonyStickerSyncItem maps a row', () => {
     expect(harmonyStickerSyncItem({ id: 'h', name: 'n', description: '', url: 'u', discord_sticker_id: 'd', removed: true }))
-      .toEqual({ id: 'h', name: 'n', discordId: 'd', removed: true })
+      .toEqual({ id: 'h', name: 'n', description: '', discordId: 'd', removed: true })
   })
 })
 
