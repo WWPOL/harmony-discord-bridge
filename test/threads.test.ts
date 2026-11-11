@@ -200,6 +200,38 @@ describe('Discord → Harmony threads', () => {
   })
 })
 
+describe('private Discord threads', () => {
+  const privateThread = (client: any, channel: any, id: string) => {
+    const t = fakeThread(client, channel, id, { name: 'Secret' })
+    t.type = ChannelType.PrivateThread
+    return t
+  }
+
+  it('relays nothing from a private thread, even one paired by older code, and logs no warning', async () => {
+    const { rt, runtime, client, channel, h } = await setup()
+    const warn = vi.spyOn(rt.log, 'warn')
+    h.lookupThread.mockResolvedValue(thread({ id: 'ht-old', discord_thread_id: 'dp-1' }))
+    rt.threads.remember('dp-1', 'ht-old')
+    const t = privateThread(client, channel, 'dp-1')
+
+    await rt.onDiscordMessage(discordMessage({ id: 'dm-p', channelId: 'dp-1', channel: t, content: 'secret' }))
+    await rt.onDiscordThreadCreate(t)
+    expect(h.sendMessage).not.toHaveBeenCalled()
+    expect(h.createThread).not.toHaveBeenCalled()
+    expect(warn).not.toHaveBeenCalled()
+    await runtime.stop()
+  })
+
+  it('harmonyThreadFor answers null for a cached private thread; discordThreadFor for a private fetch', async () => {
+    const { rt, runtime, client, channel } = await setup()
+    const t = privateThread(client, channel, 'dp-2')
+    rt.threads.remember('dp-2', 'ht-9')
+    expect(await rt.threads.harmonyThreadFor(t, 'h1')).toBeNull()
+    expect(await rt.threads.discordThreadFor('ht-9', 'h1', channel)).toBeNull()
+    await runtime.stop()
+  })
+})
+
 describe('Harmony → Discord threads', () => {
   it('a reply in a Harmony thread on a bridged message starts the Discord thread there and posts into it', async () => {
     const { rt, runtime, channel, webhook, h } = await setup()
