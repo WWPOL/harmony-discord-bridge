@@ -52,7 +52,7 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - [ ] Expression/server sync follow-ups (reuse `expressionSync.ts` modes, dry run, confirm):
   - [x] `/bridge sync-emojis` (`import-emojis` is now `mode:add`, with the old import as fallback on an older Harmony)
   - [x] `/bridge sync-stickers` (Lottie, names under 2 characters and refused files are skipped and listed)
-  - [ ] Server profile sync (name, icon, banner, description)
+  - [x] `/bridge sync-profile` (name, icon, banner, description; Mirror only; a description or banner the Discord server can't have is skipped)
   - [ ] Channel details sync (topic, slowmode, NSFW on linked channels)
   - [ ] Scheduled events, if Harmony gains them
 
