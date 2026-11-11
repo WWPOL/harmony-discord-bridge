@@ -1,4 +1,5 @@
-import { PermissionFlagsBits, type Client, type Message as DiscordMessage } from 'discord.js'
+import type { Client, Message as DiscordMessage } from 'discord.js'
+import { isPrivateThread } from './threadSync.js'
 import type { ImportThreadLike, ThreadListPage } from './historyImport.js'
 
 /** Discord REST: unknown channel / unknown message. */
@@ -14,7 +15,7 @@ function discordCode(err: unknown): number | undefined {
 
 /** Where a thread listing stands: which list, and the archive time (ISO) it continues before. */
 interface ThreadCursor {
-  list: 'active' | 'public' | 'private'
+  list: 'active' | 'public' | 'private'  // 'private' only from jobs saved by older code
   before: string | null
 }
 
@@ -36,7 +37,6 @@ export interface DiscordImportAccess {
   fetchPage(channelId: string, before: string | undefined): Promise<DiscordMessage[]>
   fetchPins(channelId: string): Promise<Set<string>>
   listThreads(channelId: string, cursor: Record<string, unknown> | null): Promise<ThreadListPage>
-  canReadPrivateThreads(channelId: string): boolean
   hasStarterMessage(channelId: string, threadId: string): Promise<boolean>
 }
 
@@ -59,21 +59,7 @@ export function discordImportAccess(getClient: () => Client | null): DiscordImpo
     return channel
   }
 
-  function canManageThreads(channel: any, c: Client): boolean {
-    const me = channel?.guild?.members?.me ?? c.user
-    return !!me && channel?.permissionsFor?.(me)?.has(PermissionFlagsBits.ManageThreads) === true
-  }
-
-  const canReadPrivateThreads = (channelId: string): boolean => {
-    const c = getClient()
-    if (!c) return false
-    const channel = c.channels.cache.get(channelId) as any
-    return !!channel && canManageThreads(channel, c)
-  }
-
   return {
-    canReadPrivateThreads,
-
     async fetchPage(channelId, before) {
       const channel = await channelOf(channelId)
       const page = await channel.messages.fetch(before ? { limit: 100, before } : { limit: 100 })
@@ -96,35 +82,35 @@ export function discordImportAccess(getClient: () => Client | null): DiscordImpo
 
     async listThreads(channelId, rawCursor) {
       const cursor = parseCursor(rawCursor)
+      // Private threads are never imported: Harmony has no private threads, so every imported
+      // thread would be readable by the whole channel. A cursor saved by older code that was
+      // already in the private list ends the listing.
+      if (cursor.list === 'private') return { threads: [], next: null }
       const channel = await channelOf(channelId)
-      const canPrivate = canManageThreads(channel, client())
-      const afterPublic = (): ThreadCursor | null => (canPrivate ? { list: 'private', before: null } : null)
 
       if (cursor.list === 'active') {
         const active = await channel.guild.channels.fetchActiveThreads()
-        const threads = (Array.from(active.threads.values()) as any[])
-          .filter(t => t.parentId === channelId)
-          .sort(byIdDesc)
-        return { threads: threads as ImportThreadLike[], next: { list: 'public', before: null } }
+        const inChannel = (Array.from(active.threads.values()) as any[]).filter(t => t.parentId === channelId)
+        const threads = inChannel.filter(t => !isPrivateThread(t)).sort(byIdDesc)
+        return {
+          threads: threads as ImportThreadLike[],
+          next: { list: 'public', before: null },
+          skippedPrivate: inChannel.length - threads.length,
+        }
       }
-
-      if (cursor.list === 'private' && !canPrivate) return { threads: [], next: null }
 
       const res = await channel.threads.fetchArchived({
-        type: cursor.list,
+        type: 'public',
         limit: 100,
-        ...(cursor.list === 'private' ? { fetchAll: true } : {}),
         ...(cursor.before ? { before: cursor.before } : {}),
       })
-      const threads = (Array.from(res.threads.values()) as any[])
+      const all = (Array.from(res.threads.values()) as any[])
         .sort((a, b) => archivedMs(b) - archivedMs(a) || byIdDesc(a, b))
-      let next: ThreadCursor | null
-      if (res.hasMore && threads.length > 0) {
-        next = { list: cursor.list, before: new Date(archivedMs(threads[threads.length - 1])).toISOString() }
-      } else {
-        next = cursor.list === 'public' ? afterPublic() : null
-      }
-      return { threads: threads as ImportThreadLike[], next: next as Record<string, unknown> | null }
+      const threads = all.filter(t => !isPrivateThread(t))
+      const next: ThreadCursor | null = res.hasMore && all.length > 0
+        ? { list: 'public', before: new Date(archivedMs(all[all.length - 1])).toISOString() }
+        : null
+      return { threads: threads as ImportThreadLike[], next: next as Record<string, unknown> | null, skippedPrivate: all.length - threads.length }
     },
 
     async hasStarterMessage(channelId, threadId) {

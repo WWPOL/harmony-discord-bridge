@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { Collection, PermissionFlagsBits } from 'discord.js'
+import { ChannelType, Collection, PermissionFlagsBits } from 'discord.js'
 import { discordImportAccess } from '../src/runtime/importDiscord.js'
 import { FakeDiscordClient, discordError } from './fakeDiscord.js'
 
@@ -101,24 +101,34 @@ describe('discordImportAccess threads', () => {
     expect(p2.next).toBeNull()
   })
 
-  it('continues with archived private threads only with Manage Threads', async () => {
-    const withPerm = setup({ manageThreads: true, publicPages: [[thread('1', 'c1', 5000)]], privatePages: [[thread('7', 'c1', 4000)]] })
-    const pub = await withPerm.access.listThreads('c1', { list: 'public', before: null })
-    expect(pub.next).toEqual({ list: 'private', before: null })
-    const priv = await withPerm.access.listThreads('c1', pub.next)
-    expect(priv.threads.map(t => t.id)).toEqual(['7'])
-    expect(withPerm.calls[1]).toMatchObject({ type: 'private', fetchAll: true })
-    expect(priv.next).toBeNull()
-
-    const without = setup({ manageThreads: false, publicPages: [[thread('1', 'c1', 5000)]], privatePages: [[thread('7', 'c1', 4000)]] })
-    expect(await without.access.listThreads('c1', { list: 'private', before: null })).toEqual({ threads: [], next: null })
-    expect(without.calls.filter(c => c.type === 'private')).toHaveLength(0)
+  it('drops private threads from the active list and counts them', async () => {
+    const { access } = setup({
+      active: [thread('11', 'c1', null), thread('12', 'c1', null, { type: ChannelType.PrivateThread }), thread('99', 'other', null, { type: ChannelType.PrivateThread })],
+    })
+    const first = await access.listThreads('c1', null)
+    expect(first.threads.map(t => t.id)).toEqual(['11'])
+    expect(first.skippedPrivate).toBe(1)
   })
 
-  it('canReadPrivateThreads follows Manage Threads', () => {
-    expect(setup({ manageThreads: true }).access.canReadPrivateThreads('c1')).toBe(true)
-    expect(setup({ manageThreads: false }).access.canReadPrivateThreads('c1')).toBe(false)
-    expect(setup().access.canReadPrivateThreads('unknown')).toBe(false)
+  it('ends after the public list even with Manage Threads, and never asks for private ones', async () => {
+    const t = setup({ manageThreads: true, publicPages: [[thread('1', 'c1', 5000)]], privatePages: [[thread('7', 'c1', 4000)]] })
+    const pub = await t.access.listThreads('c1', { list: 'public', before: null })
+    expect(pub.threads.map(x => x.id)).toEqual(['1'])
+    expect(pub.next).toBeNull()
+    expect(t.calls.filter(c => c.type === 'private')).toHaveLength(0)
+  })
+
+  it('a private thread in the archived list is filtered and counted', async () => {
+    const t = setup({ publicPages: [[thread('1', 'c1', 5000), thread('2', 'c1', 4000, { type: ChannelType.PrivateThread })]] })
+    const pub = await t.access.listThreads('c1', { list: 'public', before: null })
+    expect(pub.threads.map(x => x.id)).toEqual(['1'])
+    expect(pub.skippedPrivate).toBe(1)
+  })
+
+  it('a cursor saved by older code in the private list lists nothing', async () => {
+    const t = setup({ manageThreads: true, privatePages: [[thread('7', 'c1', 4000)]] })
+    expect(await t.access.listThreads('c1', { list: 'private', before: null })).toEqual({ threads: [], next: null })
+    expect(t.calls).toHaveLength(0)
   })
 
   it('hasStarterMessage: true when the message with the thread id exists, false on 10008', async () => {
