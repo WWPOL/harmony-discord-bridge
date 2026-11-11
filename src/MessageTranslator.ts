@@ -521,7 +521,8 @@ export class MessageTranslator {
 
     const parts: any[] = [{ type: 'text', text: '*↪ Forwarded*\n' }]
     for (const snapshot of snapshots) {
-      parts.push(...this.messageBody(snapshot, discordMsg, ctx, snapshot.content))
+      // Only the message's own stickers are ever native; a snapshot's stay images.
+      parts.push(...this.messageBody(snapshot, discordMsg, { ...ctx, harmonyStickerFor: undefined }, snapshot.content))
     }
     if (own.length > 0) parts.push({ type: 'text', text: '\n' }, ...own)
     return parts

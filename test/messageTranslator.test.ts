@@ -431,6 +431,25 @@ describe('MessageTranslator.discordToHarmonyParts', () => {
       expect(parts[2]).toEqual({ type: 'file', url: 'https://media.discordapp.net/stickers/s2.gif', fileName: 'dance.gif', fileType: 'image' })
     })
 
+    const forward = (own: Map<string, any>) => discordMessage({
+      content: '',
+      stickers: own,
+      reference: { type: 1, messageId: 'orig-1', channelId: 'other' },
+      messageSnapshots: new Map([['orig-1', discordMessage({ id: 'orig-1', content: '', stickers: new Map([['s2', { id: 's2', name: 'dance', format: 4 }]]) })]]),
+    })
+    const both = { harmonyStickerFor: (id: string) => (id === 's1' ? link : id === 's2' ? { ...link, id: 'hs-2', name: 'Dance' } : null) }
+
+    it('a forwarded snapshot sticker is never native', () => {
+      const parts = translator().discordToHarmonyParts(forward(new Map()), both)
+      expect(parts.some(p => p.type === 'sticker')).toBe(false)
+      expect(parts).toContainEqual({ type: 'file', url: 'https://media.discordapp.net/stickers/s2.gif', fileName: 'dance.gif', fileType: 'image' })
+    })
+
+    it('a message with its own and a forwarded linked sticker has exactly one sticker part, its own', () => {
+      const parts = translator().discordToHarmonyParts(forward(new Map([['s1', { id: 's1', name: 'wave', format: 1 }]])), both)
+      expect(parts.filter(p => p.type === 'sticker')).toEqual([{ type: 'sticker', id: 'hs-1', url: link.url, name: 'Wave', description: 'a waving hand' }])
+    })
+
     it('without the hook, output is unchanged', () => {
       const parts = translator().discordToHarmonyParts(discordMessage({ content: '', stickers: stickers() }))
       expect(parts.map(p => p.type)).toEqual(['file', 'file'])
