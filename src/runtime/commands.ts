@@ -31,6 +31,10 @@ import { confirmAction } from './confirmPrompt.js'
 import { CONFLICT_HINT, planSync, syncReportLines, SYNC_MODE_CHOICES, type SyncMode } from './expressionSync.js'
 import { byDiscordId, desiredEmoji, emojiDiffers, harmonyEmojiSyncItem, type DesiredEmoji } from './emojiSync.js'
 import { desiredSticker, harmonyStickerSyncItem, isStickerSkip, stickerDiffers, type DesiredSticker, type StickerSkip } from './stickerSync.js'
+import {
+  PROFILE_FIELDS, planProfileSync, profilePlanLines, profileSkipLines,
+  type DiscordProfile, type ProfileField,
+} from './profileSync.js'
 import { desiredSound, harmonySyncItem, soundDiffers, type DesiredSound } from './soundSync.js'
 
 // =============================================================================
@@ -168,6 +172,17 @@ export function buildCommands(mode: 'v1' | 'v2') {
             .addChoices(...SYNC_MODE_CHOICES))
         .addBooleanOption(opt =>
           opt.setName('dry_run').setDescription('Show what would change without making changes').setRequired(false)))
+    bridgeCommand.addSubcommand(sub => {
+      sub
+        .setName('sync-profile')
+        .setDescription('Make Harmony\'s server name, icon, banner and description match this Discord server')
+      for (const field of PROFILE_FIELDS) {
+        sub.addBooleanOption(opt =>
+          opt.setName(field).setDescription(`Sync the server ${field} (default: yes)`).setRequired(false))
+      }
+      return sub.addBooleanOption(opt =>
+        opt.setName('dry_run').setDescription('Show what would change without making changes').setRequired(false))
+    })
     bridgeCommand.addSubcommand(sub =>
       sub
         .setName('sync-sounds')
@@ -457,6 +472,9 @@ async function handleBridgeCommand(rt: BridgeRuntime, command: ChatInputCommandI
         break
       case 'sync-stickers':
         await runBridgeSyncStickers(rt, command)
+        break
+      case 'sync-profile':
+        await runBridgeSyncProfile(rt, command)
         break
       default:
         await command.reply({ content: `❌ Unknown subcommand: ${sub}`, flags: MessageFlags.Ephemeral })
@@ -1514,6 +1532,120 @@ const STICKER_FILE_REASONS: Record<string, string> = {
   size: 'over 512 KB',
   dimensions: 'over 320 × 320',
   duration: 'animation over 5 s',
+}
+
+/**
+ * `/bridge sync-profile`: copies the Discord server's name, icon, banner and description onto the
+ * paired Harmony server (mirror only: an empty field on Discord clears it on Harmony). Shows the
+ * changes and asks Confirm/Cancel before writing.
+ */
+export async function runBridgeSyncProfile(rt: BridgeRuntime, command: ChatInputCommandInteraction) {
+  await command.deferReply({ flags: MessageFlags.Ephemeral })
+
+  const guild = command.guild!
+  const bridge = rt.dir.getBridgeForDiscordGuild(guild.id)
+  if (!bridge) {
+    await command.editReply({ content: notBridgedText(rt) })
+    return
+  }
+  const serverId = bridge.harmonyServerId
+
+  const selected = {} as Record<ProfileField, boolean>
+  for (const f of PROFILE_FIELDS) selected[f] = command.options.getBoolean(f, false) ?? true
+  const dryRun = command.options.getBoolean('dry_run', false) ?? false
+  if (!PROFILE_FIELDS.some(f => selected[f])) {
+    await command.editReply({ content: 'Nothing to sync: every field is switched off.' })
+    return
+  }
+
+  let state
+  try {
+    state = await rt.harmony.getServerProfileSyncState(serverId)
+  } catch (err) {
+    if (err instanceof HarmonyHttpError && err.status === 404) {
+      await command.editReply({ content: '❌ Profile sync needs a newer Harmony (bridge profile sync endpoints).' })
+      return
+    }
+    throw err
+  }
+
+  let fresh
+  try {
+    fresh = await guild.fetch()
+  } catch (err) {
+    await command.editReply({ content: `❌ Could not read the Discord server: ${errorText(err)}` })
+    return
+  }
+  const discord: DiscordProfile = {
+    name: fresh.name,
+    description: fresh.description,
+    icon: fresh.icon,
+    banner: fresh.banner,
+    features: fresh.features,
+  }
+  const plan = planProfileSync(discord, state, selected)
+  const lines = profilePlanLines(plan)
+  const skips = profileSkipLines(plan)
+
+  if (plan.body === null) {
+    const allUnavailable = plan.fields.every(f => f.action === 'unavailable')
+    const head = allUnavailable
+      ? `Nothing to sync for **${guild.name}**.`
+      : `✅ **${guild.name}**: Harmony already matches Discord.`
+    await command.editReply({ content: [head, ...skips].join('\n') })
+    return
+  }
+
+  if (dryRun) {
+    await command.editReply({ content: [`🧪 **Dry run** for **${guild.name}**`, ...lines, ...skips].join('\n') })
+    return
+  }
+
+  const prompt = [`Sync the profile of **${guild.name}** to Harmony?`, ...lines, ...skips].join('\n')
+  if (!(await confirmAction(command, prompt, 60_000, rt.log))) return
+
+  try {
+    const result = await rt.harmony.syncServerProfile(serverId, { ...plan.body, invoker_discord_id: command.user.id })
+    if (!result.changed) {
+      await command.editReply({ content: `✅ **${guild.name}**: Harmony already matched Discord; nothing written.`, components: [] })
+      return
+    }
+    const names = (actions: string[]) => plan.fields.filter(f => actions.includes(f.action)).map(f => f.field).join(', ')
+    const updated = names(['set', 'replace'])
+    const removed = names(['clear'])
+    await command.editReply({
+      content: [
+        `✅ Profile synced for **${guild.name}**`,
+        ...(updated ? [`• Updated: ${updated}`] : []),
+        ...(removed ? [`• Removed: ${removed}`] : []),
+        ...skips,
+      ].join('\n'),
+      components: [],
+    })
+  } catch (err) {
+    await command.editReply({ content: profileSyncErrorText(err), components: [] })
+  }
+}
+
+function profileSyncErrorText(err: unknown): string {
+  if (err instanceof HarmonyHttpError) {
+    const field = String(err.details.field ?? 'image')
+    if (err.code === 'PROFILE_IMAGE') {
+      if (err.details.reason === 'size') {
+        return `❌ Could not copy the ${field}: it is over Harmony's ${field === 'banner' ? '10' : '5'} MB limit; nothing changed.`
+      }
+      if (err.details.reason === 'type') {
+        return `❌ Could not copy the ${field}: Harmony can't store that image type; nothing changed.`
+      }
+    }
+    if (err.code === 'PROFILE_IMAGE_DOWNLOAD') {
+      return `❌ Could not copy the ${field} from Discord: ${String(err.details.error ?? err.message)}; nothing changed.`
+    }
+    if (err.code === 'NO_GUILD') {
+      return "❌ Harmony doesn't know this bridge's Discord server id yet; reconnect the bridge and try again."
+    }
+  }
+  return `❌ Profile sync failed: ${errorText(err)}`
 }
 
 /**
