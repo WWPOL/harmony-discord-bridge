@@ -4,8 +4,9 @@ import { CONFLICT_HINT, planSync, syncReportLines, SYNC_MODE_CHOICES, type SyncD
 const d = (id: string, name: string, v = 1) => ({ id, name, v })
 const h = (id: string, name: string, discordId: string | null = null, v = 1) => ({ id, name, discordId, v })
 const differs = (a: { v: number }, b: { v: number }) => a.v !== b.v
-const run = (mode: 'mirror' | 'merge' | 'add', discord: Array<SyncDiscordItem & { v: number }>, harmony: Array<SyncHarmonyItem & { v: number }>, presentIds?: string[]) =>
-  planSync({ mode, discord, harmony, presentIds, differs })
+const run = (mode: 'mirror' | 'merge' | 'add', discord: Array<SyncDiscordItem & { v: number }>, harmony: Array<SyncHarmonyItem & { v: number }>, presentIds?: string[], limit?: number) =>
+  planSync({ mode, discord, harmony, presentIds, differs, limit })
+const rm = (id: string, name: string, discordId: string | null = null, v = 1) => ({ ...h(id, name, discordId, v), removed: true })
 
 describe('SYNC_MODE_CHOICES', () => {
   it('lists mirror first with short names', () => {
@@ -172,5 +173,106 @@ describe('syncReportLines', () => {
     const lines = syncReportLines(run('add', items, []), { dryRun: true, label, noun: 'sound' })
     expect(lines).toHaveLength(1 + 20 + 1)
     expect(lines[lines.length - 1]).toBe('  • …and 5 more')
+  })
+})
+
+describe('planSync restore and limit', () => {
+  it('restores a removed linked item in mirror and merge, counts it outdated in add', () => {
+    const harmony = [rm('H1', 'a', '1')]
+    for (const mode of ['mirror', 'merge'] as const) {
+      const p = run(mode, [d('1', 'a')], harmony)
+      expect(p.restore.map(r => [r.discord.id, r.harmony.id])).toEqual([['1', 'H1']])
+      expect(p.unchanged).toBe(0)
+      expect(p.update).toHaveLength(0)
+      expect(p.delete).toHaveLength(0)
+    }
+    const renamed = run('merge', [d('1', 'b', 2)], harmony)
+    expect(renamed.restore).toHaveLength(1)
+    expect(renamed.update).toHaveLength(0)
+    const p = run('add', [d('1', 'a')], harmony)
+    expect(p.restore).toHaveLength(0)
+    expect(p.outdated).toBe(1)
+    expect(p.add).toHaveLength(0)
+  })
+
+  it('ignores removed unlinked items: no name clash, no delete', () => {
+    const harmony = [rm('H1', 'a')]
+    for (const mode of ['mirror', 'merge', 'add'] as const) {
+      const p = run(mode, [d('1', 'a')], harmony)
+      expect(p.add.map(x => x.id)).toEqual(['1'])
+      expect(p.conflict).toHaveLength(0)
+      expect(p.replace).toHaveLength(0)
+      expect(p.delete).toHaveLength(0)
+    }
+  })
+
+  it('mirror does not delete removed items', () => {
+    const p = run('mirror', [], [rm('H1', 'a', '9'), rm('H2', 'b')])
+    expect(p.delete).toHaveLength(0)
+  })
+
+  it('merge reports an unlinked holder of a restored item name', () => {
+    const harmony = [rm('H1', 'old', '1'), h('H2', 'new')]
+    const p = run('merge', [d('1', 'new')], harmony)
+    expect(p.restore.map(r => r.harmony.id)).toEqual(['H1'])
+    expect(p.conflict.map(c => [c.discord.id, c.harmony.map(x => x.id)])).toEqual([['1', ['H2']]])
+  })
+
+  it('limit moves the newest creates and restores to overLimit in Discord order', () => {
+    const harmony = [h('H0', 'x', '0'), rm('H3', 'c', '3')]
+    const p = run('merge', [d('0', 'x'), d('1', 'a'), d('2', 'b'), d('3', 'c')], harmony, undefined, 3)
+    expect(p.limit).toBe(3)
+    expect(p.unchanged).toBe(1)
+    expect(p.add.map(x => x.id)).toEqual(['1', '2'])
+    expect(p.restore).toHaveLength(0)
+    expect(p.overLimit.map(x => x.id)).toEqual(['3'])
+  })
+
+  it('mirror deletes free slots before the limit applies', () => {
+    const harmony = [h('H0', 'gone0'), h('H1', 'gone1'), h('H2', 'x', '2')]
+    const p = run('mirror', [d('2', 'x'), d('3', 'a'), d('4', 'b')], harmony, undefined, 3)
+    expect(p.delete).toHaveLength(2)
+    expect(p.add.map(x => x.id)).toEqual(['3', '4'])
+    expect(p.overLimit).toHaveLength(0)
+    const q = run('mirror', [d('1', 'a')], [h('H1', 'a'), h('H2', 'a')], undefined, 2)
+    expect(q.replace).toHaveLength(1)
+    expect(q.overLimit).toHaveLength(0)
+  })
+
+  it('limit 0 or absent means no limit', () => {
+    const items = [d('1', 'a'), d('2', 'b'), d('3', 'c')]
+    for (const limit of [undefined, 0]) {
+      const p = run('merge', items, [], undefined, limit)
+      expect(p.add).toHaveLength(3)
+      expect(p.overLimit).toHaveLength(0)
+      expect(p.limit).toBe(0)
+    }
+  })
+})
+
+describe('syncReportLines restore and limit', () => {
+  const label = (n: string) => n
+  it('lists restores and over-limit items with the hint, and never says Already matches with overLimit', () => {
+    const harmony = [rm('H1', 'b', '2')]
+    const plan2 = run('merge', [d('2', 'b'), d('3', 'c')], harmony, undefined, 3)
+    const opts = { dryRun: true, label, noun: 'emoji', nounPlural: 'emoji', limitHint: 'Delete some, then re-run.' }
+    expect(syncReportLines(plan2, opts)).toEqual(['Would add 1 emoji', '  • c', 'Would restore 1 emoji', '  • b'])
+    const over = run('merge', [d('1', 'a'), d('2', 'b')], [h('H0', 'x', '0')], undefined, 1)
+    const lines = syncReportLines(over, { ...opts })
+    expect(lines).toContain('Skipped 2 emoji: limit reached (1 per server)')
+    const one = run('merge', [d('1', 'a'), d('2', 'b')], [h('H0', 'x', '0')], undefined, 2)
+    const l1 = syncReportLines(one, opts)
+    expect(l1.slice(0, 3)).toEqual(['Would add 1 emoji', '  • a', 'Skipped 1 emoji: limit reached (2 per server)'])
+    expect(l1).toContain('  • b')
+    expect(l1[l1.length - 1]).toBe('Delete some, then re-run.')
+    const onlyOver = run('merge', [d('1', 'a')], [h('H0', 'x', '0')], undefined, 1)
+    expect(syncReportLines(onlyOver, opts).join(' ')).not.toContain('Already matches')
+    expect(syncReportLines(plan2, { ...opts, dryRun: false })[2]).toBe('Restore 1 emoji')
+  })
+
+  it('uses nounPlural when given, and noun + s otherwise', () => {
+    const two = run('mirror', [d('1', 'a'), d('2', 'b')], [])
+    expect(syncReportLines(two, { dryRun: true, label, noun: 'emoji', nounPlural: 'emoji' })[0]).toBe('Would add 2 emoji')
+    expect(syncReportLines(two, { dryRun: true, label, noun: 'sound' })[0]).toBe('Would add 2 sounds')
   })
 })
