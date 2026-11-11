@@ -24,9 +24,12 @@ export interface Problem {
   params?: Record<string, string>
 }
 
+/** Params that describe a problem without identifying it: a new count replaces the old entry. */
+const UNKEYED_PARAMS = new Set(['count'])
+
 export function problemKey(p: Problem): string {
   const params = p.params
-    ? Object.keys(p.params).sort().map(k => `${k}=${p.params![k]}`).join(',')
+    ? Object.keys(p.params).filter(k => !UNKEYED_PARAMS.has(k)).sort().map(k => `${k}=${p.params![k]}`).join(',')
     : ''
   return `${p.code}${params ? `:${params}` : ''}`
 }
