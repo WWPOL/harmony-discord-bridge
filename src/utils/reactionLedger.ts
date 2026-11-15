@@ -45,6 +45,11 @@ export class ReactionLedger {
     return { messageId: entry.messageId, emoji: entry.emoji, last: remaining === 0, remaining }
   }
 
+  /** Whether the reaction is a recorded holder. */
+  has(reactionId: string): boolean {
+    return this.byReaction.has(reactionId)
+  }
+
   count(messageId: string, emoji: string): number {
     return this.holders.get(ReactionLedger.key(messageId, emoji))?.size ?? 0
   }

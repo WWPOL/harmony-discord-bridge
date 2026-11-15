@@ -58,6 +58,7 @@ export interface DiscordImportAccess {
   ensureNotice(channelId: string): Promise<void>
   listThreads(channelId: string, cursor: Record<string, unknown> | null): Promise<ThreadListPage>
   hasStarterMessage(channelId: string, threadId: string): Promise<boolean>
+  fetchThread(channelId: string, threadId: string): Promise<ImportThreadLike | null>
 }
 
 /**
@@ -189,6 +190,18 @@ export function discordImportAccess(getClient: () => Client | null, guildId: () 
         ? { list: 'public', before: new Date(archivedMs(all[all.length - 1])).toISOString() }
         : null
       return { threads: threads as ImportThreadLike[], next: next as Record<string, unknown> | null, skippedPrivate: all.length - threads.length }
+    },
+
+    async fetchThread(channelId, threadId) {
+      let thread: any
+      try {
+        thread = await channelOf(threadId)
+      } catch (err) {
+        if (discordCode(err) === UNKNOWN_CHANNEL) return null
+        throw err
+      }
+      if (thread.isThread?.() !== true || thread.parentId !== channelId || isPrivateThread(thread)) return null
+      return thread as ImportThreadLike
     },
 
     async hasStarterMessage(channelId, threadId) {

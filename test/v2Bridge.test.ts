@@ -316,7 +316,7 @@ describe('V2Bridge history import', () => {
       }
       discordClientForImport() { return null }
       translateForImport = vi.fn(async () => null)
-      threadStarterForImport = vi.fn(async () => null)
+      threadStarterForImport = vi.fn(async () => ({ discordUser: null, plainTitle: false }))
     }
     return { ...g, imports, calls, control, fetchImpl, ImportRuntime }
   }
@@ -558,6 +558,62 @@ describe('V2Bridge opt-out list', () => {
     const g = privacyGateway('v1')
     await g.b.start()
     expect(g.runtimes[0].opts.hooks!.privacyApi).toBeDefined()
+    await g.b.stop()
+  })
+
+  it('starts no runtime when stopped while it read the list', async () => {
+    const g = privacyGateway('v1')
+    let release!: () => void
+    const held = new Promise<void>(r => { release = r })
+    const api = (g.b as any).api
+    const inner = api.options.fetchImpl
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      if (String(url).endsWith('/bridge/v2/privacy/optouts')) await held
+      return inner(url, init)
+    })
+    api.options.fetchImpl = fetchImpl
+    const starting = g.b.start()
+    await vi.waitFor(() => expect(fetchImpl.mock.calls.some(c => String(c[0]).endsWith('/privacy/optouts'))).toBe(true))
+    const stopping = g.b.stop()
+    release()
+    await starting
+    await stopping
+    expect(g.runtimes[0].started).toBe(0)
+  })
+
+  it('reads the list once for callers that ask together, and again when the version moved meanwhile', async () => {
+    const g = privacyGateway('v1')
+    await g.b.start()
+    expect(g.list.reads).toBe(1)
+    let release!: () => void
+    const held = new Promise<void>(r => { release = r })
+    const api = (g.b as any).api
+    const inner = api.options.fetchImpl
+    let first = true
+    api.options.fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      if (String(url).endsWith('/bridge/v2/privacy/optouts') && first) {
+        first = false
+        await held
+        g.list.reads++
+        return Response.json({ version: 'v2', remote_user_ids: ['111', '222'] })
+      }
+      return inner(url, init)
+    })
+    g.state.config = config({ privacy_version: 'v2' })
+    await g.b.refreshConfig('test')
+    const a = (g.b as any).syncOptOuts()
+    expect((g.b as any).syncOptOuts()).toBe(a)
+    // The version moves again while the read is in flight.
+    g.list.version = 'v3'
+    g.list.ids = ['333']
+    g.state.config = config({ privacy_version: 'v3' })
+    await g.b.refreshConfig('test')
+    release()
+    await a
+    await vi.advanceTimersByTimeAsync(10)
+    expect(g.list.reads).toBe(3)
+    expect(g.runtimes[0].optOuts.version()).toBe('v3')
+    expect(g.runtimes[0].optOuts.has('333')).toBe(true)
     await g.b.stop()
   })
 })

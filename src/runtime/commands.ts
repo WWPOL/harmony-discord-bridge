@@ -23,7 +23,7 @@ import {
 import { describeProblem } from '../problems.js'
 import { DiscordAuthorLimiter } from './antiSpam.js'
 import { memberJoinedAt } from '../utils/discordUserMetadata.js'
-import { isAuthorOptedOut, isAutomodBlocked, HarmonyHttpError } from '../HarmonyClient.js'
+import { isAuthorOptedOut, isAutomodBlocked, HarmonyHttpError, type HarmonyEmojiSyncRow } from '../HarmonyClient.js'
 import { errorText } from '../log.js'
 import { confirmAction } from './confirmPrompt.js'
 import { CONFLICT_HINT, DEFAULT_SYNC_MODE, planSync, syncConfirmLines, syncReportLines, SYNC_MODE_CHOICES, type SyncMode } from './expressionSync.js'
@@ -457,11 +457,25 @@ async function handlePrivacyCommand(rt: BridgeRuntime, command: ChatInputCommand
     else rt.optOuts.remove(userId)
     return s
   }
+  /**
+   * The caller is on the list while the call runs: the relay and the importer send nothing of
+   * theirs that could commit after Harmony's erase read. A failed call puts the list back.
+   */
+  const heldOut = async <T>(call: () => Promise<T>): Promise<T> => {
+    const was = rt.optOuts.has(userId)
+    rt.optOuts.add(userId)
+    try {
+      return await call()
+    } catch (err) {
+      if (!was) rt.optOuts.remove(userId)
+      throw err
+    }
+  }
 
   try {
     switch (sub) {
       case 'opt-out': {
-        const s = follow(await api.putOptOut(userId, command.user.username))
+        const s = follow(await heldOut(() => api.putOptOut(userId, command.user.username)))
         rt.log.info(`/bridge-privacy opt-out by ${userId} in guild ${guild.id}`)
         await say(s.source === 'manager' || s.source === 'admin'
           ? standingText(s)
@@ -483,8 +497,7 @@ async function handlePrivacyCommand(rt: BridgeRuntime, command: ChatInputCommand
       case 'erase': {
         const prompt = '⚠️ This deletes your bridged and imported messages on Harmony for this server, and opts you out of the bridge. Your Discord messages stay. It cannot be undone. Confirm?'
         if (!(await confirmAction(command, prompt, undefined, rt.log))) return
-        const { erased, more } = await api.erase(userId)
-        rt.optOuts.add(userId)
+        const { erased, more } = await heldOut(() => api.erase(userId))
         rt.log.info(`/bridge-privacy erase by ${userId} in guild ${guild.id}: ${erased} message(s)${more ? ', more in the background' : ''}`)
         await say(`✅ Deleted ${erased} of your messages on Harmony${more ? '; the rest are being deleted in the background' : ''}. You are opted out: your messages in this server no longer go to Harmony.`)
         break
@@ -1199,7 +1212,8 @@ async function startImportHistory(
   ])
   if (!(await confirmAction(command, prompt, undefined, rt.log))) return
 
-  const requestedBy = { id: command.user.id, username: command.user.username }
+  // An opted-out member's id and name stay out of the job (requested_by_remote).
+  const requestedBy = rt.optOuts?.has(command.user.id) ? undefined : { id: command.user.id, username: command.user.username }
   let ids = viewable
   const notImportable: string[] = []
   let jobs: ImportJob[] = []
@@ -1216,7 +1230,7 @@ async function startImportHistory(
     }
   }
   rt.log.info(`/bridge import-history start by ${command.user.id} in guild ${guild.id}: ${jobs.length} job(s) for ${ids.length} channel(s)${hidden.length > 0 ? `, ${hidden.length} hidden from the invoker` : ''}`)
-  rt.hooks.kickImports?.()
+  rt.hooks.kickImports?.(jobs.map(j => j.id))
 
   const lines = [jobs.length === 0
     ? 'Nothing to import: Harmony queued no channel.'
@@ -1393,6 +1407,51 @@ function namedList(header: string, names: string[], label: (n: string) => string
 }
 
 /**
+ * Report lines for sounds whose Discord custom emoji has no active Harmony copy, by what can bring
+ * one: `/bridge sync-emojis` restores an emoji the bridge removed earlier; `/bridge import-emojis`
+ * (add mode) adds one Harmony lacks. Neither restores an emoji a person removed, adds one whose
+ * name a Harmony emoji holds, or adds past the emoji limit.
+ */
+async function soundEmojiHints(
+  rt: BridgeRuntime,
+  serverId: string,
+  discordEmojis: Array<{ id: string | null; name: string | null }>,
+): Promise<string[]> {
+  if (discordEmojis.length === 0) return []
+  const importHint = (n: number) => `Run \`/bridge import-emojis\` to carry the custom emoji of ${n} sound(s).`
+  let state: { limit: number; emojis: HarmonyEmojiSyncRow[] }
+  try {
+    state = await rt.harmony.getEmojiSyncState(serverId)
+  } catch {
+    return ['', importHint(discordEmojis.length)]
+  }
+  const byDiscordId = new Map(state.emojis.filter(e => e.discord_emoji_id).map(e => [e.discord_emoji_id as string, e]))
+  const activeNames = new Set(state.emojis.filter(e => !e.removed).map(e => e.name.toLowerCase()))
+  const full = state.limit > 0 && state.emojis.filter(e => !e.removed).length >= state.limit
+  let importable = 0
+  let restorable = 0
+  let removed = 0
+  let clashing = 0
+  let overLimit = 0
+  for (const { id, name } of discordEmojis) {
+    const linked = id ? byDiscordId.get(id) : undefined
+    const wanted = id && name ? desiredEmoji({ id, name, animated: false, available: true })?.name ?? null : null
+    if (linked?.removed && linked.restorable === true) restorable++
+    else if (linked?.removed) removed++
+    else if (!linked && wanted && activeNames.has(wanted.toLowerCase())) clashing++
+    else if (full) overLimit++
+    else importable++
+  }
+  const lines: string[] = []
+  if (importable > 0) lines.push(importHint(importable))
+  if (restorable > 0) lines.push(`Run \`/bridge sync-emojis\` to bring back the custom emoji of ${restorable} sound(s): the bridge removed it on Harmony earlier.`)
+  if (removed > 0) lines.push(`${removed} sound(s) go without their Discord emoji: it was removed on Harmony, and the bridge does not restore what a person removed.`)
+  if (clashing > 0) lines.push(`${clashing} sound(s) go without their Discord emoji: a Harmony emoji has its name. Rename or delete that one, then run \`/bridge import-emojis\`.`)
+  if (overLimit > 0) lines.push(`${overLimit} sound(s) go without their Discord emoji: the Harmony server has reached its emoji limit (${state.limit}).`)
+  return lines.length > 0 ? ['', ...lines] : []
+}
+
+/**
  * `/bridge sync-sounds`: copies the guild's soundboard to Harmony. Merge (default) adds and
  * updates. Mirror also deletes the sounds copied from a Discord sound that is gone, after
  * Confirm/Cancel. A sound a member uploaded on Harmony is never deleted or replaced.
@@ -1417,6 +1476,8 @@ async function syncSounds(rt: BridgeRuntime, command: ChatInputCommandInteractio
   const guild = command.guild!
   const say = (content: string) => command.editReply({ content, components: [] })
 
+  /** Discord sound id -> its custom emoji's Discord id, from the last read. */
+  let discordEmojiOf = new Map<string, { id: string | null; name: string | null }>()
   /** Reads both sides and plans. Null after replying, when a side cannot be read. */
   const prepare = async () => {
     let harmonyRows
@@ -1457,12 +1518,14 @@ async function syncSounds(rt: BridgeRuntime, command: ChatInputCommandInteractio
       emojiName: s.emoji?.name ?? null,
       available: s.available !== false,
     }))
+    discordEmojiOf = new Map(inputs.map(s => [s.soundId, { id: s.emojiId, name: s.emojiName }]))
     const plan = planSync({
       mode,
       discord: inputs.filter(s => s.available).map(s => desiredSound(s, harmonyEmojiFor)),
       presentIds: inputs.filter(s => !s.available).map(s => s.soundId),
       harmony: harmonyRows.map(harmonySyncItem),
       differs: soundDiffers,
+      limit: HARMONY_SOUND_LIMIT,
     })
     return { plan, discordEmpty: inputs.length === 0, active: harmonyRows.length }
   }
@@ -1483,8 +1546,8 @@ async function syncSounds(rt: BridgeRuntime, command: ChatInputCommandInteractio
 
   const removalsOf = (p: Plan) => [...p.delete, ...p.replace.flatMap(r => r.harmony)]
   if (removalsOf(plan).length + plan.add.length + plan.update.length === 0) {
-    // Clashing, outdated or kept sounds can remain; say so instead of "matches".
-    const left = plan.conflict.length + plan.outdated + plan.kept.length > 0
+    // Clashing, outdated, kept or over-limit sounds can remain; say so instead of "matches".
+    const left = plan.conflict.length + plan.outdated + plan.kept.length + plan.overLimit.length > 0
     await say(left
       ? joinLinesWithinDiscordLimit([
         `${plan.conflict.length > 0 ? '⚠️' : '✅'} Nothing to apply (${mode}) for **${guild.name}**`,
@@ -1600,6 +1663,7 @@ async function syncSounds(rt: BridgeRuntime, command: ChatInputCommandInteractio
   }
 
   const kept = plan.kept.length + keptByHarmony.length
+  skippedFull.unshift(...plan.overLimit.map(d => d.name))
   rt.log.info(`/bridge sync-sounds (${mode}) by ${command.user.id} in guild ${guild.id}: added ${counts.created}, updated ${counts.updated}, replaced ${counts.replaced}, deleted ${counts.deleted}, kept ${kept}, skipped ${skippedFull.length}, failed ${failures.length}`)
 
   const lines = [
@@ -1618,10 +1682,7 @@ async function syncSounds(rt: BridgeRuntime, command: ChatInputCommandInteractio
   if (plan.conflict.length > 0) {
     lines.push(...namedList(`⚠️ ${plan.conflict.length} name clash(es), left as they are:`, plan.conflict.map(c => c.discord.name), n => n), CONFLICT_HINT)
   }
-  const noEmoji = applied.filter(d => d.hadUnimportedEmoji).length
-  if (noEmoji > 0) {
-    lines.push('', `Run \`/bridge import-emojis\` first to carry the custom emoji of ${noEmoji} sound(s).`)
-  }
+  lines.push(...await soundEmojiHints(rt, serverId, applied.filter(d => d.hadUnimportedEmoji).map(d => discordEmojiOf.get(d.id) ?? { id: null, name: null })))
   lines.push(...namedList(`⚠️ ${failures.length} failure(s):`, failures, n => n, 15))
   await say(joinLinesWithinDiscordLimit(lines))
 }
@@ -1737,7 +1798,7 @@ async function syncEmojis(rt: BridgeRuntime, command: ChatInputCommandInteractio
   const removals = removalsOf(plan)
   if (removals.length > 0) {
     const n = removals.length
-    const tail = 'Removed emoji stay in old messages; an instance administrator can restore them. Confirm?'
+    const tail = 'Removed emoji keep showing in old messages, and an instance administrator can restore them, until Harmony makes room: it keeps the 500 removed last and deletes older ones with their images. Confirm?'
     const warning = first.discordEmpty
       ? `⚠️ This Discord server has no emoji. This removes all ${n} Harmony emoji the bridge imported. ${tail}`
       : `⚠️ This removes ${n} Harmony emoji the bridge imported. ${tail}`
@@ -1986,7 +2047,7 @@ async function syncStickers(rt: BridgeRuntime, command: ChatInputCommandInteract
   const removals = removalsOf(plan)
   if (removals.length > 0) {
     const n = removals.length
-    const tail = 'Removed stickers leave the sticker list. Old messages keep showing them. Confirm?'
+    const tail = 'Removed stickers leave the sticker list. Old messages keep showing them until Harmony makes room: it keeps the 60 removed last and deletes older ones with their images. Confirm?'
     const warning = first.discordEmpty
       ? `⚠️ This Discord server has no stickers. This removes all ${n} Harmony sticker${n === 1 ? '' : 's'} copied from Discord. ${tail}`
       : `⚠️ This removes ${n} Harmony sticker${n === 1 ? '' : 's'} copied from Discord. ${tail}`

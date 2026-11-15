@@ -74,6 +74,9 @@ function setup(opts: {
   listThreads?: (channel: string, cursor: Record<string, unknown> | null) => Promise<any>
   /** The importer's clock; NOW by default. */
   now?: () => number
+  threadStarter?: (thread: any) => Promise<{ discordUser: Record<string, unknown> | null; plainTitle: boolean }>
+  /** fetchThread by id; default: the thread of that id on any listing page, else null. */
+  fetchThread?: (id: string) => Promise<any>
 } = {}) {
   const all = opts.all ?? []
   const patches: Array<Record<string, unknown>> = []
@@ -114,6 +117,9 @@ function setup(opts: {
   const everyoneCanView = vi.fn(async () => opts.everyoneCanView ?? true)
   const ensureNotice = vi.fn(async (_channel: string) => {})
   const onStickerRefused = vi.fn()
+  const onImported = vi.fn()
+  const fetchThread = vi.fn(async (_c: string, id: string) =>
+    opts.fetchThread ? opts.fetchThread(id) : (opts.threadPages ?? []).flat().find((t: any) => t.id === id) ?? null)
   const reportProblem = vi.fn()
   const sleeps: number[] = []
   const log = new Logger('debug', '', true)
@@ -131,9 +137,11 @@ function setup(opts: {
     })),
     listThreads,
     hasStarterMessage: vi.fn(async (_c: string, threadId: string) => opts.starters?.has(threadId) ?? false),
-    threadStarter: vi.fn(async (t: any) => (t.ownerId ? { id: t.ownerId } : null)),
+    fetchThread,
+    threadStarter: opts.threadStarter ?? vi.fn(async (t: any) => ({ discordUser: t.ownerId ? { id: t.ownerId } : null, plainTitle: false })),
     ...(optOuts ? { optOuts } : {}),
     onStickerRefused,
+    onImported,
     reportProblem,
     pageDelayMs: opts.pageDelayMs ?? 7,
     now: opts.now ?? (() => NOW),
@@ -141,7 +149,7 @@ function setup(opts: {
     log,
   })
   const j = job({ ...opts.jobOver })
-  return { importer, api, patches, posts, fetchPage, fetchMembers, everyoneCanView, ensureNotice, onStickerRefused, optOuts, sleeps, j, listThreads, reportProblem, log }
+  return { importer, api, patches, posts, fetchPage, fetchMembers, everyoneCanView, ensureNotice, onStickerRefused, onImported, fetchThread, optOuts, sleeps, j, listThreads, reportProblem, log }
 }
 
 const stateOf = (patches: Array<Record<string, unknown>>) => patches.filter(p => 'state' in p).map(p => p.state)
@@ -168,7 +176,7 @@ describe('HistoryImporter messages phase', () => {
     })
     expect(patches.filter(p => 'reached_discord_message_id' in p).map(p => p.reached_discord_message_id))
       .toEqual([SNOW(151), SNOW(51), SNOW(1)])
-    expect(patches.slice(-4)).toEqual([{ phase: 'threads' }, { threads_total: 0 }, { phase: 'replies' }, { state: 'done' }])
+    expect(patches.slice(-4)).toEqual([{ phase: 'threads' }, { threads_total: 0 }, { phase: 'replies' }, { state: 'done', thread_cursor: null }])
     expect(api.getImport).toHaveBeenCalled()
   })
 
@@ -208,7 +216,7 @@ describe('HistoryImporter messages phase', () => {
     const { importer, posts, patches, j } = setup({ all: [] })
     expect(await run(importer, j)).toBe('done')
     expect(posts).toHaveLength(0)
-    expect(patches).toEqual([{ state: 'running' }, { phase: 'threads' }, { threads_total: 0 }, { phase: 'replies' }, { state: 'done' }])
+    expect(patches).toEqual([{ state: 'running' }, { phase: 'threads' }, { threads_total: 0 }, { phase: 'replies' }, { state: 'done', thread_cursor: null }])
   })
 
   it('returns cancelled and patches cancelled when cancel_requested is set after a page', async () => {
@@ -298,7 +306,7 @@ describe('HistoryImporter messages phase', () => {
     const { importer, api, patches, j } = setup({ all: [] })
     api.updateImport.mockRejectedValueOnce(new BridgeApiError('down', 502))
     expect(await run(importer, j)).toBe('done')
-    expect(patches).toEqual([{ state: 'running' }, { phase: 'threads' }, { threads_total: 0 }, { phase: 'replies' }, { state: 'done' }])
+    expect(patches).toEqual([{ state: 'running' }, { phase: 'threads' }, { threads_total: 0 }, { phase: 'replies' }, { state: 'done', thread_cursor: null }])
   })
 
   it('returns cancelled at once when cancel_requested is already set at run start', async () => {
@@ -440,7 +448,9 @@ describe('HistoryImporter authors', () => {
       threadMessages: { [T]: history(3, () => ({ author: { id: 'gone', bot: false } })) },
     })
     await run(importer, j)
-    expect(patches.find(p => 'threads_done' in p)).toMatchObject({ threads_done: 1, authors_skipped: 3 })
+    expect(patches.find(p => (p.thread_cursor as any)?.current)).toMatchObject({ authors_skipped: 3, thread_cursor: { current: { id: T } } })
+    expect(patches.find(p => 'threads_done' in p)).toMatchObject({ threads_done: 1 })
+    expect(patches.filter(p => 'authors_skipped' in p).map(p => p.authors_skipped)).toEqual([3])
   })
 })
 
@@ -540,7 +550,7 @@ describe('HistoryImporter Harmony error policy', () => {
     expect(await run(importer, j)).toBe('done')
     expect(posts.map(p => p.length)).toEqual([100, 50])
     expect(posts.flat().filter(m => m.discord_message_id === SNOW(150))).toHaveLength(1)
-    expect(patches.at(-1)).toEqual({ state: 'done' })
+    expect(patches.at(-1)).toEqual({ state: 'done', thread_cursor: null })
   })
 
   it('adds the author of a message Harmony rejects as opted_out to the list', async () => {
@@ -641,14 +651,16 @@ describe('HistoryImporter stickers Harmony refuses', () => {
     expect(onStickerRefused).toHaveBeenCalledWith('hs-1')
   })
 
-  it('gives up on the message when the image is rejected too', async () => {
-    const { importer, api, posts, j } = setup({ all: all(), translate })
+  it('gives up on the message when the image is rejected too, and keeps the sticker link', async () => {
+    const { importer, api, posts, onStickerRefused, j } = setup({ all: all(), translate })
     api.postImportMessages.mockImplementation(async (_id: string, messages: ImportMessage[]) => {
       posts.push(messages)
       return { inserted: [], skipped: [SNOW(2)], rejected: messages.some(m => m.discord_message_id === SNOW(2)) ? [{ discord_message_id: SNOW(2), reason: 'invalid' }] : [] }
     })
     expect(await run(importer, j)).toBe('done')
     expect(posts).toHaveLength(2)
+    // The refusal was not the sticker's: the image version was refused as well.
+    expect(onStickerRefused).not.toHaveBeenCalled()
   })
 
   it('falls back the same way when an older gateway refuses the batch for the sticker message', async () => {
@@ -737,7 +749,7 @@ describe('HistoryImporter threads and replies phases', () => {
     const { importer, patches, posts, j } = setup({ all: history(3), listThreads: (c, cur) => access.listThreads(c, cur) })
     expect(await run(importer, j)).toBe('done')
     expect(posts.flat()).toHaveLength(3)
-    expect(patches.at(-1)).toEqual({ state: 'done' })
+    expect(patches.at(-1)).toEqual({ state: 'done', thread_cursor: null })
     expect(patches.some(p => p.state === 'paused')).toBe(false)
   })
 
@@ -784,7 +796,7 @@ describe('HistoryImporter threads and replies phases', () => {
     const realUpdate = (importer as any).deps.api.updateImport.getMockImplementation()!
     ;(importer as any).deps.api.updateImport.mockImplementation((id: string, patch: any, o?: unknown) => { at.push(clock); return realUpdate(id, patch, o) })
     expect(await run(importer, j)).toBe('done')
-    expect(patches.filter(p => Object.keys(p).join() === 'authors_skipped').length).toBeGreaterThanOrEqual(2)
+    expect(patches.filter(p => (p.thread_cursor as any)?.current?.id === T1).length).toBeGreaterThanOrEqual(2)
     const gaps = at.slice(1).map((t, i) => t - at[i])
     expect(Math.max(...gaps)).toBeLessThanOrEqual(KEEPALIVE_MS + 60_000)
   })
@@ -812,7 +824,7 @@ describe('HistoryImporter threads and replies phases', () => {
     api.importThread.mockRejectedValueOnce(new BridgeApiError('bad thread', 400, 'invalid_thread'))
     expect(await run(importer, j)).toBe('done')
     expect(api.importThread).toHaveBeenCalledTimes(2)
-    expect(patches.at(-1)).toEqual({ state: 'done' })
+    expect(patches.at(-1)).toEqual({ state: 'done', thread_cursor: null })
   })
 
   it('fails the job when the parent channel is lost while looking for a thread starter', async () => {
@@ -874,9 +886,12 @@ describe('HistoryImporter threads and replies phases', () => {
   it('checkpoints the ids of the threads it finished', async () => {
     const { importer, patches, j } = setup({ all: [], threadPages: [[thread(T1), thread(T2)]] })
     await run(importer, j)
+    const since = new Date(NOW).toISOString()
     expect(patches.filter(p => 'thread_cursor' in p).map(p => p.thread_cursor)).toEqual([
-      { at: null, done: [T1] },
-      { at: null, done: [T1, T2] },
+      { at: null, done: [T1], active: [T1, T2], since, finished: [T1] },
+      { at: { list: 'recheck' }, done: [], active: [T1, T2], since, finished: [T1, T2] },
+      // Done: the cursor goes.
+      null,
     ])
   })
 
@@ -911,7 +926,7 @@ describe('HistoryImporter threads and replies phases', () => {
     expect(fetchPage).not.toHaveBeenCalled()
     expect(listThreads).not.toHaveBeenCalled()
     expect(api.linkImportReplies).toHaveBeenCalledTimes(1)
-    expect(patches).toEqual([{ state: 'running' }, { state: 'done' }])
+    expect(patches).toEqual([{ state: 'running' }, { state: 'done', thread_cursor: null }])
   })
 
   it('raises private_threads_skipped once, with the count summed over pages', async () => {
@@ -940,7 +955,7 @@ describe('HistoryImporter threads and replies phases', () => {
     expect(await run(importer, j)).toBe('done')
     expect(api.linkImportReplies).toHaveBeenCalledTimes(1)
     expect(api.linkImportReplies.mock.calls[0][0]).toBe('job-1')
-    expect(patches.slice(-3)).toEqual([{ phase: 'replies' }, { linkCalled: true }, { state: 'done' }])
+    expect(patches.slice(-3)).toEqual([{ phase: 'replies' }, { linkCalled: true }, { state: 'done', thread_cursor: null }])
   })
 
   it('ends with the server state on a 409 from importThread', async () => {
@@ -1179,14 +1194,220 @@ describe('BridgeRuntime.translateForImport', () => {
     await runtime.stop()
   })
 
-  it('leaves out the starter of a thread who left the guild; names one who opted out by id alone', async () => {
+  it('leaves out the starter of a thread who left the guild or opted out, and their title; names one who opted out by id alone', async () => {
     const { runtime, rt } = await runtimeSetup()
     const present = fakeMember('g1', 'owner-1')
-    const guild = { id: 'g1', members: { fetch: vi.fn(async (id: string) => { if (id === 'owner-1') return present; throw discordError(10007) }) } }
-    expect(await rt.threadStarterForImport({ id: 't1', ownerId: 'owner-1', guild })).toMatchObject({ id: 'owner-1' })
-    expect(await rt.threadStarterForImport({ id: 't2', ownerId: 'gone-1', guild })).toBeNull()
+    const guild = { id: 'g1', members: { fetch: vi.fn(async (id: string) => {
+      if (id === 'owner-1') return present
+      if (id === 'flaky-1') throw Object.assign(new Error('Internal Server Error'), { status: 500 })
+      throw discordError(10007)
+    }) } }
+    const member = await rt.threadStarterForImport({ id: 't1', ownerId: 'owner-1', guild })
+    expect(member).toMatchObject({ discordUser: { id: 'owner-1' }, plainTitle: false })
+    expect(await rt.threadStarterForImport({ id: 't2', ownerId: 'gone-1', guild })).toEqual({ discordUser: null, plainTitle: true })
+    expect(await rt.threadStarterForImport({ id: 't0', ownerId: null, guild })).toEqual({ discordUser: null, plainTitle: false })
+    await expect(rt.threadStarterForImport({ id: 't4', ownerId: 'flaky-1', guild })).rejects.toThrow('Internal Server Error')
     rt.optOuts.add('owner-1')
-    expect(await rt.threadStarterForImport({ id: 't3', ownerId: 'owner-1', guild })).toEqual({ id: 'owner-1' })
+    expect(await rt.threadStarterForImport({ id: 't3', ownerId: 'owner-1', guild })).toEqual({ discordUser: { id: 'owner-1' }, plainTitle: true })
     await runtime.stop()
+  })
+})
+
+describe('HistoryImporter thread progress, revived threads and thread titles', () => {
+  const TA = SNOW(500)
+  const TB = SNOW(600)
+  const TC = SNOW(700)
+  const gone = (msgs: any[]) => msgs.map(m => ({ ...m, author: { id: 'gone', bot: false } }))
+
+  it('records its place inside a thread after each page', async () => {
+    const { importer, patches, j } = setup({ all: [], threadPages: [[thread(TA)]], threadMessages: { [TA]: threadMsgs(1000, 250) } })
+    expect(await run(importer, j)).toBe('done')
+    expect(patches.filter(p => (p.thread_cursor as any)?.current).map(p => (p.thread_cursor as any).current)).toEqual([
+      { id: TA, before: SNOW(1151) },
+      { id: TA, before: SNOW(1051) },
+      { id: TA, before: SNOW(1001) },
+    ])
+  })
+
+  it('resumes a thread below the recorded message and counts no skip twice', async () => {
+    const { importer, fetchPage, patches, j } = setup({
+      all: [],
+      absent: ['gone'],
+      jobOver: {
+        phase: 'threads', state: 'running', authors_skipped: 2,
+        thread_cursor: { at: null, done: [], active: [TA], current: { id: TA, before: SNOW(1003) } },
+      } as Partial<ImportJob>,
+      threadPages: [[thread(TA)]],
+      threadMessages: { [TA]: gone(threadMsgs(1000, 5)) },
+    })
+    expect(await run(importer, j)).toBe('done')
+    expect(fetchPage.mock.calls.find(c => c[0] === TA)![1]).toBe(SNOW(1003))
+    expect(patches.filter(p => 'authors_skipped' in p).at(-1)!.authors_skipped).toBe(4)
+  })
+
+  it('imports a thread revived while archived threads were listed, after the archived pages', async () => {
+    let actives = 0
+    const listThreads = async (_c: string, cursor: Record<string, unknown> | null) => {
+      if (cursor === null) {
+        actives++
+        // TC was archived at the first listing and is active again at the last pass.
+        return { threads: actives === 1 ? [thread(TA)] : [thread(TA), thread(TC)], next: { page: 1 } }
+      }
+      return { threads: [thread(TB, { archiveTimestamp: NOW - 5_000 })], next: null }
+    }
+    const { importer, api, j } = setup({ all: [], listThreads })
+    expect(await run(importer, j)).toBe('done')
+    expect(api.importThread.mock.calls.map(c => (c[1] as any).discord_thread_id)).toEqual([TA, TB, TC])
+  })
+
+  it('leaves a thread started after the recency cutoff to the live relay in the last pass', async () => {
+    const fresh = snowflakeAt(NOW)
+    let actives = 0
+    const listThreads = async (_c: string, cursor: Record<string, unknown> | null) => {
+      if (cursor === null) {
+        actives++
+        return { threads: actives === 1 ? [thread(TA)] : [thread(TA), thread(fresh)], next: null }
+      }
+      return { threads: [], next: null }
+    }
+    const { importer, api, j } = setup({ all: [], listThreads })
+    expect(await run(importer, j)).toBe('done')
+    expect(api.importThread.mock.calls.map(c => (c[1] as any).discord_thread_id)).toEqual([TA])
+  })
+
+  it('imports the thread of a starter who left or opted out as Thread', async () => {
+    const threadStarter = vi.fn(async (t: any) => t.id === TA
+      ? { discordUser: null, plainTitle: true }
+      : { discordUser: { id: 'owner-b', username: 'b' }, plainTitle: false })
+    const { importer, api, j } = setup({ all: [], threadPages: [[thread(TA, { ownerId: 'left' }), thread(TB, { ownerId: 'owner-b' })]], threadStarter })
+    expect(await run(importer, j)).toBe('done')
+    const sent = api.importThread.mock.calls.map(c => c[1] as any)
+    expect(sent.map(t => [t.name, t.discord_user])).toEqual([
+      ['Thread', null],
+      [`thread ${TB}`, { id: 'owner-b', username: 'b' }],
+    ])
+  })
+
+  it('imports a thread revived and archived again while the archived threads were paged', async () => {
+    const iso = (ms: number) => new Date(ms).toISOString()
+    let publicCalls = 0
+    const listThreads = async (_c: string, cursor: Record<string, unknown> | null) => {
+      if (cursor === null) return { threads: [thread(TA)], next: { list: 'public', before: null } }
+      publicCalls++
+      // The pager's page: TC is not on it (archived further down when it started).
+      if (publicCalls === 1) return { threads: [thread(TB, { archiveTimestamp: NOW - 5_000 })], next: null }
+      // The last pass: TC was archived again after the first listing, so it sorts first.
+      return {
+        threads: [thread(TC, { archiveTimestamp: NOW + 60_000 }), thread(TB, { archiveTimestamp: NOW - 5_000 })],
+        next: { list: 'public', before: iso(NOW - 5_000) },
+      }
+    }
+    const { importer, api, j } = setup({ all: [], listThreads })
+    expect(await run(importer, j)).toBe('done')
+    expect(api.importThread.mock.calls.map(c => (c[1] as any).discord_thread_id)).toEqual([TA, TB, TC])
+    expect(publicCalls).toBe(2)
+  })
+
+  it('finishes first a thread an earlier run stopped in, though no listing shows it now', async () => {
+    const { importer, api, fetchPage, fetchThread, patches, j } = setup({
+      all: [],
+      jobOver: {
+        phase: 'threads', state: 'running', threads_done: 0,
+        thread_cursor: { at: { page: 0 }, done: [], active: [TA], since: new Date(NOW).toISOString(), current: { id: TC, before: SNOW(1003) } },
+      } as Partial<ImportJob>,
+      threadPages: [[thread(TA)]],
+      fetchThread: async (id: string) => (id === TC ? thread(TC) : null),
+      threadMessages: { [TC]: threadMsgs(1000, 5) },
+    })
+    expect(await run(importer, j)).toBe('done')
+    expect(fetchThread).toHaveBeenCalledWith('1001', TC)
+    expect(fetchPage.mock.calls.find(c => c[0] === TC)![1]).toBe(SNOW(1003))
+    expect(api.importThread.mock.calls.map(c => (c[1] as any).discord_thread_id)).toEqual([TC, TA])
+    // Once it is done, the cursor names it finished and no longer current.
+    const cursors = patches.filter(p => p.thread_cursor).map(p => p.thread_cursor as any)
+    const doneAt = cursors.findIndex(c => c.finished?.includes(TC))
+    expect(doneAt).toBeGreaterThanOrEqual(0)
+    expect(cursors.slice(doneAt).every(c => c.current?.id !== TC && c.finished?.includes(TC))).toBe(true)
+  })
+
+  it('skips a finished thread when a later page lists it', async () => {
+    const { importer, api, j } = setup({
+      all: [],
+      jobOver: {
+        phase: 'threads', state: 'running', threads_done: 0,
+        thread_cursor: { at: { page: 0 }, done: [], active: [TA], current: { id: TB, before: SNOW(1003) } },
+      } as Partial<ImportJob>,
+      threadPages: [[thread(TA)], [thread(TB)]],
+    })
+    expect(await run(importer, j)).toBe('done')
+    expect(api.importThread.mock.calls.map(c => (c[1] as any).discord_thread_id)).toEqual([TB, TA])
+  })
+
+  it('a cursor of an earlier build never gains an active list, and has no last pass', async () => {
+    const { importer, api, listThreads, patches, j } = setup({
+      all: [],
+      jobOver: { phase: 'threads', state: 'running', threads_done: 0, thread_cursor: { at: { page: 1 }, done: [] } },
+      threadPages: [[thread(TA)], [thread(TB)]],
+    })
+    expect(await run(importer, j)).toBe('done')
+    expect(api.importThread.mock.calls.map(c => (c[1] as any).discord_thread_id)).toEqual([TB])
+    expect(patches.filter(p => p.thread_cursor).every(p => !('active' in (p.thread_cursor as any)))).toBe(true)
+    expect(listThreads).toHaveBeenCalledTimes(1)
+  })
+
+  it('tells the relay which Discord messages a batch stored', async () => {
+    const { importer, onImported, j } = setup({ all: history(3) })
+    expect(await run(importer, j)).toBe('done')
+    expect(onImported).toHaveBeenCalledWith([SNOW(3), SNOW(2), SNOW(1)])
+  })
+
+  it('the keepalive PATCH carries the skip count last sent, not a partial one', async () => {
+    let clock = NOW
+    const { importer, patches, j } = setup({ all: [], now: () => clock })
+    const run0 = { job: j, signal: new AbortController().signal, started: true, cutoff: CUTOFF, members: new Map(),
+      authorsSkipped: 9, authorsSkippedSent: 4, threadsSkipped: 0, lastPatchAt: clock }
+    clock += KEEPALIVE_MS
+    await (importer as any).keepAlive(run0)
+    expect(patches).toEqual([{ authors_skipped: 4 }])
+    expect(run0.authorsSkippedSent).toBe(4)
+  })
+})
+
+describe('HistoryImporter review round 3', () => {
+  const TA = SNOW(500)
+  const TB = SNOW(600)
+
+  it('walks a thread of the active page once, also when it is listed again among the archived ones', async () => {
+    const listThreads = async (_c: string, cursor: Record<string, unknown> | null) => cursor === null
+      ? { threads: [thread(TA)], next: { page: 1 } }
+      // TA archived while the active page was walked.
+      : { threads: [thread(TA, { archived: true, archiveTimestamp: NOW - 5_000 }), thread(TB, { archived: true, archiveTimestamp: NOW - 9_000 })], next: null }
+    const { importer, api, j } = setup({ all: [], listThreads })
+    expect(await run(importer, j)).toBe('done')
+    expect(api.importThread.mock.calls.map(c => (c[1] as any).discord_thread_id)).toEqual([TA, TB])
+  })
+
+  it('clears what history import stored and what it answered as skipped from the lookup misses', async () => {
+    const { importer, api, onImported, j } = setup({ all: history(3) })
+    api.postImportMessages.mockImplementationOnce(async (_id: string, messages: ImportMessage[]) => ({
+      inserted: [{ discord_message_id: messages[0].discord_message_id, id: 'hm-a' }],
+      skipped: messages.slice(1).map(m => m.discord_message_id),
+      rejected: [],
+    }))
+    expect(await run(importer, j)).toBe('done')
+    expect(new Set(onImported.mock.calls.flat(2))).toEqual(new Set([SNOW(1), SNOW(2), SNOW(3)]))
+  })
+
+  // harmonyCall races every Harmony call with the run's signal.
+  it('stops at once when the run is stopped during its opt-out read', async () => {
+    const { importer, optOuts, posts, j } = setup({ all: history(3), optedOut: [] })
+    optOuts!.refresh.mockImplementation(() => new Promise<void>(() => {}))
+    const stop = new AbortController()
+    const running = importer.run(j, stop.signal)
+    await Promise.resolve()
+    stop.abort()
+    const outcome = await Promise.race([running.then(r => r.result), new Promise(res => setTimeout(() => res('hung'), 50))])
+    expect(outcome).not.toBe('hung')
+    expect(posts).toEqual([])
   })
 })

@@ -1,5 +1,5 @@
 import { ChannelType, type AnyThreadChannel, type TextChannel } from 'discord.js'
-import type { HarmonyClient } from '../HarmonyClient.js'
+import { HarmonyHttpError, type HarmonyClient } from '../HarmonyClient.js'
 import { BoundedMap } from '../utils/BoundedMap.js'
 import { errorText } from '../log.js'
 
@@ -50,6 +50,8 @@ export interface ThreadSyncDeps {
   harmonyMessageFor(discordMessageId: string, harmonyChannelId: string): Promise<string | null>
   /** The Discord message a Harmony message was bridged to, or null. */
   discordMessageFor(harmonyMessageId: string, harmonyChannelId: string): Promise<string | null>
+  /** Drops a mapping whose Harmony message is gone. */
+  forgetHarmonyMessage?(harmonyMessageId: string): void
   log: { info(msg: string): void; warn(msg: string): void; debug(msg: string): void }
 }
 
@@ -101,13 +103,25 @@ export class ThreadSync {
         this.remember(thread.id, found.id)
         return found.id
       }
-      const starter = await this.deps.harmonyMessageFor(thread.id, harmonyChannelId)
+      let starter = await this.deps.harmonyMessageFor(thread.id, harmonyChannelId)
       const discordUser = await this.deps.threadStarter?.(thread).catch(() => null) ?? null
-      const created = await this.deps.harmony.createThread(harmonyChannelId, threadName(thread.name), {
-        messageId: starter,
+      const create = (messageId: string | null) => this.deps.harmony.createThread(harmonyChannelId, threadName(thread.name), {
+        messageId,
         discordThreadId: thread.id,
         ...(discordUser ? { discordUser } : {}),
       })
+      let created
+      try {
+        created = await create(starter)
+      } catch (error) {
+        // 404: the mapped starter is gone from the channel (erased, purged, or a re-paired
+        // channel's). The thread starts standalone.
+        if (!starter || !(error instanceof HarmonyHttpError) || error.status !== 404) throw error
+        this.deps.log.debug(`Harmony message ${starter} is gone; Discord thread ${thread.id} starts standalone`)
+        this.deps.forgetHarmonyMessage?.(starter)
+        starter = null
+        created = await create(null)
+      }
       this.remember(thread.id, created.id)
       this.deps.log.info(`Discord thread ${thread.id} → Harmony thread ${created.id}${starter ? ` on ${starter}` : ''}`)
       return created.id

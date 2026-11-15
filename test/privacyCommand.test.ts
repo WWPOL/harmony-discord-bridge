@@ -157,6 +157,24 @@ describe('/bridge-privacy', () => {
     expect(t.rt.log.error).not.toHaveBeenCalled()
   })
 
+  it.each(['opt-out', 'erase'])('%s keeps the caller out of the relay while Harmony answers', async (sub) => {
+    const t = setup(sub)
+    let during: boolean | null = null
+    t.api.putOptOut.mockImplementation(async () => { during = t.optOuts.has('u1'); return SELF })
+    t.api.erase.mockImplementation(async () => { during = t.optOuts.has('u1'); return { erased: 1, more: false } })
+    await handleInteraction(t.rt, t.interaction)
+    expect(during).toBe(true)
+    expect(t.optOuts.has('u1')).toBe(true)
+  })
+
+  it('a failed erase leaves the list as it was', async () => {
+    const t = setup('erase')
+    t.api.erase.mockRejectedValue(new BridgeApiError('POST failed (503)', 503))
+    await handleInteraction(t.rt, t.interaction)
+    expect(t.last()).toContain('`/bridge-privacy erase` failed')
+    expect(t.optOuts.has('u1')).toBe(false)
+  })
+
   it('reports a failure to the caller and leaves the list as it was', async () => {
     const t = setup('opt-out')
     t.api.putOptOut.mockRejectedValue(new BridgeApiError('PUT failed (503)', 503))

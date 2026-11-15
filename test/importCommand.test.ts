@@ -164,10 +164,18 @@ describe('/bridge import-history', () => {
     await handleInteraction(t.rt, t.interaction)
     expect(t.api.startImports).toHaveBeenCalledWith(['d1'], { id: 'u1', username: 'dana' })
     expect(t.order.indexOf('confirm')).toBeLessThan(t.order.indexOf('startImports'))
-    expect(t.kick).toHaveBeenCalled()
+    // The jobs it started are named: their earlier waits and stall counts go.
+    expect(t.kick).toHaveBeenCalledWith([expect.any(String)])
     expect(edited(t)).toContain('Importing history for 1 channel(s)')
     expect(t.deferReply.mock.calls[0][0].flags).toBeDefined()
     expect(t.rt.log.info).toHaveBeenCalledWith(expect.stringMatching(/import-history start by u1 in guild g: 1 job\(s\) for 1 channel\(s\)/))
+  })
+
+  it('start by an opted-out member does not name them', async () => {
+    const t = setup()
+    t.rt.optOuts = { has: (id: string) => id === 'u1' }
+    await handleInteraction(t.rt, t.interaction)
+    expect(t.api.startImports).toHaveBeenCalledWith(['d1'], undefined)
   })
 
   it('start in a thread uses the parent channel', async () => {

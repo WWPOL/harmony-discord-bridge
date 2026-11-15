@@ -177,3 +177,21 @@ describe('HarmonyClient REST', () => {
     expect(c.isAuthRejected()).toBe(true)
   })
 })
+
+describe('HarmonyClient.getMessage', () => {
+  const client = (fetchImpl: FetchLike) => new HarmonyClient('tok', 'ws://unused', 'https://har.example/bot-gateway', {
+    log: silentLogger,
+    fetchImpl,
+    retry: { sleep: async () => {} },
+  })
+
+  it('answers null for a message that is gone or out of reach', async () => {
+    expect(await client(sequence(new Response('', { status: 404 }))).getMessage('m')).toBeNull()
+    expect(await client(sequence(new Response('', { status: 403 }))).getMessage('m')).toBeNull()
+  })
+
+  it('throws on a failure, so a caller does not take it for no message', async () => {
+    const failing = vi.fn(async () => new Response('down', { status: 503 }))
+    await expect(client(failing).getMessage('m')).rejects.toBeInstanceOf(HarmonyHttpError)
+  })
+})

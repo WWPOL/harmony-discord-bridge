@@ -24,7 +24,7 @@ afterEach(() => {
 })
 
 /** A runtime whose Discord client is ready. `me`: the body GET /users/@me answers, or null for a 503. */
-async function setup(opts: { me?: Record<string, unknown> | null; hooks?: RuntimeHooks } = {}) {
+async function setup(opts: { me?: Record<string, unknown> | null; hooks?: RuntimeHooks; guild?: string } = {}) {
   const clients: FakeDiscordClient[] = []
   const fetchImpl = vi.fn(async (url: string | URL) => {
     const u = String(url)
@@ -36,7 +36,7 @@ async function setup(opts: { me?: Record<string, unknown> | null; hooks?: Runtim
   const runtime = new BridgeRuntime({
     mode: 'v2',
     directory: new V2Directory({
-      bridge_id: 'b', server_id: 's', mode: 'self', discord_guild_id: 'g1',
+      bridge_id: 'b', server_id: 's', mode: 'self', discord_guild_id: opts.guild ?? 'g1',
       settings: { sync_member_list: false }, pairs: [], harmony_channels: [],
     }),
     writer,
@@ -68,7 +68,7 @@ async function setup(opts: { me?: Record<string, unknown> | null; hooks?: Runtim
     ;(runtime.harmony as any).handlePayload({ op: 0, t: 'READY', d: { bot: { id: 'hb', username: 'bridge' }, session_id: 's', ...(capabilities ? { capabilities } : {}) } })
     await vi.advanceTimersByTimeAsync(0)
   }
-  return { runtime, registrations, harmonyReady }
+  return { runtime, registrations, harmonyReady, put }
 }
 
 describe('slash command registration by gateway capability', () => {
@@ -98,6 +98,51 @@ describe('slash command registration by gateway capability', () => {
     expect(registrations()[0]).toContain('sync-stickers')
     await harmonyReady(['bridge_sticker_sync'])
     expect(registrations()).toHaveLength(1)
+    await runtime.stop()
+  })
+
+  it('sends no registration for a guild the bot is not in, at READY or after', async () => {
+    const { runtime, put, harmonyReady } = await setup({ guild: 'g2' })
+    await harmonyReady(['bridge_privacy'])
+    await runtime.refreshCommands()
+    expect(put).not.toHaveBeenCalled()
+    await runtime.stop()
+  })
+
+  it('skips a guild the bot is not in at startup, also when Harmony answered first', async () => {
+    const { runtime, put, harmonyReady } = await setup({ guild: 'g2' })
+    await harmonyReady(['bridge_privacy'])
+    const rt = runtime as any
+    rt.discordStartupDone = false
+    await rt.onDiscordReady(rt.discord)
+    expect(put).not.toHaveBeenCalled()
+    await runtime.stop()
+  })
+
+  it('registers again when the bot is invited back after being removed', async () => {
+    const { Events } = await import('discord.js')
+    const { runtime, registrations } = await setup({ me: { id: 'hb' } })
+    expect(registrations()).toHaveLength(1)
+    const client = (runtime as any).discord
+    client.emit(Events.GuildDelete, { id: 'g1' })
+    client.emit(Events.GuildCreate, { id: 'g1' })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(registrations()).toHaveLength(2)
+    await runtime.stop()
+  })
+
+  it('sends one registration for callers that ask at the same time', async () => {
+    const { runtime, put } = await setup({ me: { id: 'hb' } })
+    expect(put).toHaveBeenCalledTimes(1)
+    ;(runtime as any).registeredCommands.clear()
+    let release!: () => void
+    put.mockImplementationOnce((() => new Promise<void>(res => { release = res })) as any)
+    const client = (runtime as any).discord
+    const first = (runtime as any).registerCommandsFor(client, 'g1')
+    const second = (runtime as any).registerCommandsFor(client, 'g1')
+    release()
+    await Promise.all([first, second])
+    expect(put).toHaveBeenCalledTimes(2)
     await runtime.stop()
   })
 

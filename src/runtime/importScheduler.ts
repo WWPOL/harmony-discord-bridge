@@ -121,8 +121,11 @@ export class ImportScheduler {
   /** In memory: when (a counter) this process last saw each job pause; 0/absent = not paused by us. */
   private readonly pausedAt = new Map<string, number>()
   private pauseCounter = 0
-  /** In memory: the progress fingerprint at the last pause and how many pauses in a row left it unchanged. */
-  private readonly stalls = new Map<string, { fingerprint: string; count: number }>()
+  /**
+   * In memory: the progress fingerprint and state at the last pause, and how many pauses in a row
+   * left the fingerprint unchanged.
+   */
+  private readonly stalls = new Map<string, { fingerprint: string; count: number; state: ImportJob['state'] }>()
   /** In memory: the time before which a job is not picked; Harmony asked for a wait. */
   private readonly notBefore = new Map<string, number>()
 
@@ -158,6 +161,15 @@ export class ImportScheduler {
     await this.current
   }
 
+  /**
+   * Jobs a person started again: a wait and a stall count left from earlier runs are dropped.
+   * Then polls now.
+   */
+  restart(ids: readonly string[]): void {
+    for (const id of ids) this.forget(id)
+    this.kick()
+  }
+
   /** Polls now instead of at the next interval. No-op while not armed. */
   kick(): void {
     if (this.stopped || !this.timer || this.polling || this.current) return
@@ -189,6 +201,12 @@ export class ImportScheduler {
 
     for (const id of [...new Set([...this.pausedAt.keys(), ...this.notBefore.keys()])]) {
       if (!jobs.some(j => j.id === id && PRIORITY[j.state] !== undefined)) this.forget(id)
+    }
+    // A job this process left paused or running is queued again only by a person's Resume or
+    // Import again.
+    for (const j of jobs) {
+      const at = this.stalls.get(j.id)?.state
+      if (j.state === 'queued' && at !== undefined && at !== 'queued') this.forget(j.id)
     }
     const job = nextJob(jobs, this.pausedAt, this.notBefore, this.now())
     if (!job) {
@@ -282,7 +300,7 @@ export class ImportScheduler {
     const fp = fingerprint(latest)
     const prev = this.stalls.get(id)
     const count = prev && prev.fingerprint === fp ? prev.count + 1 : 1
-    this.stalls.set(id, { fingerprint: fp, count })
+    this.stalls.set(id, { fingerprint: fp, count, state: latest.state })
     if (count < STALL_LIMIT) this.notBefore.set(id, this.now() + STALL_BACKOFF_MS[count - 1])
     if (count >= STALL_LIMIT) {
       log?.warn(`History import ${id}: no progress after ${count} pauses, failing it`)

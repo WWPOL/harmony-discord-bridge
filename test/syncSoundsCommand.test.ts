@@ -19,6 +19,8 @@ function setup(opts: {
   /** Harmony rows answered to the read after Confirm; default: the same rows. */
   harmonyAfterConfirm?: unknown[]
   emojis?: unknown[] | Error
+  /** What GET /servers/:id/emojis/discord answers; absent: a call that fails. */
+  emojiState?: { limit: number; emojis: unknown[] }
   confirm?: 'confirm' | 'cancel' | 'timeout'
 }) {
   const calls: string[] = []
@@ -71,6 +73,10 @@ function setup(opts: {
       getServerEmojis: vi.fn(async () => {
         if (opts.emojis instanceof Error) throw opts.emojis
         return opts.emojis ?? []
+      }),
+      getEmojiSyncState: vi.fn(async () => {
+        if (!opts.emojiState) throw new Error('no emoji state')
+        return opts.emojiState
       }),
       deleteServerSound: vi.fn(async (_s: string, id: string) => { calls.push(`delete:${id}`) }),
       importDiscordSound: vi.fn(async (_s: string, sound: any, update: boolean): Promise<any> => {
@@ -413,5 +419,70 @@ describe('runBridgeSyncSounds', () => {
     })
     await runBridgeSyncSounds(t.rt, t.command)
     expect(t.last()).toContain('/bridge import-emojis')
+  })
+
+  it('does not suggest /bridge import-emojis for an emoji a person removed on Harmony', async () => {
+    const t = setup({
+      mode: 'merge',
+      discord: [discordSound('d1', 'horn', { emoji: { id: 'e1', name: 'party' } })],
+      harmony: [],
+      emojiState: { limit: 50, emojis: [{ id: 'x', name: 'party', discord_emoji_id: 'e1', removed: true, imported: true, restorable: false }] },
+    })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.last()).not.toContain('/bridge import-emojis')
+    expect(t.last()).toContain('removed on Harmony')
+  })
+
+  it('suggests /bridge sync-emojis for an emoji the bridge removed earlier: add mode does not restore it', async () => {
+    const t = setup({
+      mode: 'merge',
+      discord: [discordSound('d1', 'horn', { emoji: { id: 'e1', name: 'party' } })],
+      harmony: [],
+      emojiState: { limit: 50, emojis: [{ id: 'x', name: 'party', discord_emoji_id: 'e1', removed: true, imported: true, restorable: true }] },
+    })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.last()).toContain('/bridge sync-emojis')
+    expect(t.last()).not.toContain('Run `/bridge import-emojis`')
+  })
+
+  it('names a clash when a Harmony emoji holds the Discord emoji\'s name', async () => {
+    const t = setup({
+      mode: 'merge',
+      discord: [discordSound('d1', 'horn', { emoji: { id: 'e1', name: 'party' } })],
+      harmony: [],
+      emojiState: { limit: 50, emojis: [{ id: 'm', name: 'Party', discord_emoji_id: null, removed: false, imported: false }] },
+    })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.last()).toContain('a Harmony emoji has its name')
+    expect(t.last()).not.toContain('Run `/bridge import-emojis` to carry')
+  })
+
+  it('does not suggest /bridge import-emojis when Harmony\'s emoji limit is reached', async () => {
+    const t = setup({
+      mode: 'merge',
+      discord: [discordSound('d1', 'horn', { emoji: { id: 'e1', name: 'party' } })],
+      harmony: [],
+      emojiState: { limit: 1, emojis: [{ id: 'y', name: 'other', discord_emoji_id: null, removed: false }] },
+    })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.last()).not.toContain('/bridge import-emojis')
+    expect(t.last()).toContain('emoji limit (1)')
+  })
+  it('a dry run counts the soundboard cap: what does not fit is listed as skipped, not as added', async () => {
+    const members = Array.from({ length: 40 }, (_, i) => harmonyRow(`m${i}`, `m${i}`))
+    const discord = Array.from({ length: 20 }, (_, i) => discordSound(`d${i}`, `s${i}`))
+    const t = setup({ dryRun: true, discord, harmony: members })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.calls).toEqual([])
+    expect(t.last()).toContain('Would add 8 sounds')
+    expect(t.last()).toContain('Skipped 12 sounds: limit reached (48 per server)')
+  })
+
+  it('a real run at the cap lists what the plan left out as skipped', async () => {
+    const members = Array.from({ length: 47 }, (_, i) => harmonyRow(`m${i}`, `m${i}`))
+    const t = setup({ discord: [discordSound('d1', 'horn'), discordSound('d2', 'bell')], harmony: members })
+    await runBridgeSyncSounds(t.rt, t.command)
+    expect(t.calls).toHaveLength(1)
+    expect(t.last()).toContain('1 skipped: the Harmony soundboard is full')
   })
 })

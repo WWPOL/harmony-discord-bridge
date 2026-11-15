@@ -81,7 +81,7 @@ describe('runBridgeSyncStickers', () => {
       harmony: [hRow('h2', 'oldname', '2'), hRow('h3', 'back', '3', true), hRow('h4', 'same', '4', false, 'old text'), hRow('h9', 'stale', '9'), hRow('h5', 'mine')],
     })
     await runBridgeSyncStickers(t.rt, t.command)
-    expect(t.replies[0].content.split('\n')[0]).toBe('⚠️ This removes 1 Harmony sticker copied from Discord. Removed stickers leave the sticker list. Old messages keep showing them. Confirm?')
+    expect(t.replies[0].content.split('\n')[0]).toBe('⚠️ This removes 1 Harmony sticker copied from Discord. Removed stickers leave the sticker list. Old messages keep showing them until Harmony makes room: it keeps the 60 removed last and deletes older ones with their images. Confirm?')
     expect(t.calls).toEqual(['remove:h9', 'create:fresh', 'update:newname', 'update:same', 'update:back'])
     expect(t.rt.stickerLinks.replace).toHaveBeenCalledTimes(1)
     const text = last(t)

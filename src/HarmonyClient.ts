@@ -62,6 +62,15 @@ export function isAuthorOptedOut(err: unknown): boolean {
 }
 
 /**
+ * A send whose `reply_to` names no message of the channel: 400 `{code: "REPLY_OUT_OF_SCOPE"}` on
+ * Harmony 1.9.7, a 500 with the trigger's text before it.
+ */
+export function isReplyOutOfScope(err: unknown): boolean {
+  return err instanceof HarmonyHttpError
+    && (err.code === 'REPLY_OUT_OF_SCOPE' || (err.status >= 500 && err.message.startsWith('REPLY_OUT_OF_SCOPE')))
+}
+
+/**
  * A relay whose Discord message id another bot already stored in the channel
  * (409 `{code: "DISCORD_MESSAGE_ID_TAKEN"}`); final, not retried.
  */
@@ -532,17 +541,24 @@ export class HarmonyClient extends EventEmitter {
     return null
   }
 
+  /** The message, or null when there is none or the bot may not read it. Throws on any other failure. */
   async getMessage(messageId: string): Promise<any | null> {
     const response = await this.request(`/messages/${messageId}`)
-    if (!response.ok) return null
+    if (response.status === 404 || response.status === 403) return null
+    await this.expectOk(response, 'Message read failed')
     return response.json()
   }
 
+  /**
+   * The live message of a channel holding a Discord message id (thread messages included), or null
+   * when none does or the bot may not read it. Throws on any other failure.
+   */
   async lookupMessageByDiscordId(channelId: string, discordMessageId: string): Promise<any | null> {
     const response = await this.request(
       `/channels/${channelId}/messages/lookup?discord_message_id=${encodeURIComponent(discordMessageId)}`,
     )
-    if (!response.ok) return null
+    if (response.status === 404 || response.status === 403) return null
+    await this.expectOk(response, 'Message lookup failed')
     return response.json()
   }
 

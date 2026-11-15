@@ -37,6 +37,7 @@ export interface RuntimeLike {
   translateForImport?: BridgeRuntime['translateForImport']
   threadStarterForImport?: BridgeRuntime['threadStarterForImport']
   forgetStickerLink?: BridgeRuntime['forgetStickerLink']
+  forgetLookupMisses?: BridgeRuntime['forgetLookupMisses']
   /** Opted-out Discord users, kept in step with Harmony's list. */
   optOuts?: OptOutList
 }
@@ -178,9 +179,9 @@ export class V2Bridge {
    * Polls for import jobs now. A scheduler that disarmed itself on a refusal is armed again
    * first. No-op while the configuration has import off.
    */
-  kickImports(): void {
+  kickImports(restarted: string[] = []): void {
     this.syncImports()
-    this.scheduler?.kick()
+    this.scheduler?.restart(restarted)
   }
 
   /** Whether this bridge may import at all: self-run, with its own Discord client. */
@@ -209,8 +210,9 @@ export class V2Bridge {
       translate: (msg, member, o) => runtime.translateForImport!(msg, member, o),
       threadStarter: thread => runtime.threadStarterForImport!(thread),
       onStickerRefused: id => runtime.forgetStickerLink?.(id),
+      onImported: ids => runtime.forgetLookupMisses?.(ids),
       optOuts: optOuts && {
-        refresh: signal => this.loadOptOuts(signal),
+        refresh: () => this.syncOptOuts(),
         has: id => optOuts.has(id),
         add: id => optOuts.add(id),
       },
@@ -246,31 +248,44 @@ export class V2Bridge {
     else scheduler.disarm()
   }
 
-  /**
-   * Reads the server's opt-out list. No-op on a gateway without the privacy routes
-   * (`privacy_version` absent). Rejects when the list cannot be read.
-   */
-  private async loadOptOuts(signal?: AbortSignal): Promise<void> {
-    const list = this.runtime?.optOuts
-    const version = this.directory?.config().privacy_version ?? null
-    if (!list || version === null) return
-    // One attempt: the importer retries at job level, the orchestrator at its next configuration read.
+  /** Reads the server's opt-out list once. Rejects when it cannot be read. */
+  private async loadOptOuts(list: OptOutList, version: string): Promise<void> {
     await list.load(async () => {
-      const { version: listVersion, remoteUserIds } = await this.api.getOptOuts(signal ? { signal } : {})
+      // One attempt: the importer retries at job level, the orchestrator at its next configuration read.
+      const { version: listVersion, remoteUserIds } = await this.api.getOptOuts({})
       return { version: listVersion ?? version, ids: remoteUserIds }
     })
     this.log.debug(`Opt-out list read: ${list.size()} user(s)`)
   }
 
-  /** Reads the opt-out list when the configuration's `privacy_version` is not the list's. */
+  /**
+   * Brings the opt-out list to the configuration's `privacy_version`: one read at a time, and one
+   * more when the version moved during a read. No-op on a gateway without the privacy routes
+   * (`privacy_version` absent). Rejects when a read fails; the importer then does not start, and
+   * the orchestrator tries again at its next configuration read.
+   */
+  private syncOptOuts(): Promise<void> {
+    if (this.optOutLoad) return this.optOutLoad
+    const version = () => this.directory?.config().privacy_version ?? null
+    const load = (async () => {
+      for (let wanted = version(); ;) {
+        const list = this.runtime?.optOuts
+        if (!list || wanted === null || list.version() === wanted) return
+        await this.loadOptOuts(list, wanted)
+        const now = version()
+        if (now === wanted) return
+        wanted = now
+      }
+    })()
+    this.optOutLoad = load
+    load.finally(() => { if (this.optOutLoad === load) this.optOutLoad = null }).catch(() => {})
+    return load
+  }
+
+  /** syncOptOuts, logging a failed read instead of rejecting. */
   private refreshOptOuts(): Promise<void> {
-    const list = this.runtime?.optOuts
-    const version = this.directory?.config().privacy_version ?? null
-    if (!list || version === null || list.version() === version) return Promise.resolve()
-    this.optOutLoad ??= this.loadOptOuts()
+    return this.syncOptOuts()
       .catch(err => this.log.warn(`Could not read the opt-out list; trying again at the next configuration read: ${errorText(err)}`))
-      .finally(() => { this.optOutLoad = null })
-    return this.optOutLoad
   }
 
   private noteConfigError(err: unknown): 'auth' | 'unreachable' {
@@ -339,7 +354,7 @@ export class V2Bridge {
         afterPairsWritten: () => this.refreshConfig('pairs written'),
         harmonyAuthHint: this.opts.authHint,
         discordTokenHint: this.opts.discordTokenHint,
-        kickImports: () => this.kickImports(),
+        kickImports: restarted => this.kickImports(restarted),
         importApi: this.importCapable() ? this.api : undefined,
         importEnabled: () => this.importEnabled(),
         privacyApi: this.api,
@@ -368,6 +383,8 @@ export class V2Bridge {
     // Before the runtime relays anything, so an opted-out author's first message is not sent.
     // A list that cannot be read does not hold the bridge back: Harmony refuses such a message.
     await this.refreshOptOuts()
+    // stop() during the read already stopped this runtime; starting it would leave it running.
+    if (this.stopped) return
     try {
       await runtime.start()
     } catch (err) {

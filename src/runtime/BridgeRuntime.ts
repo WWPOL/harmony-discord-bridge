@@ -24,7 +24,7 @@ import {
   type PartialMessage,
   type AnyThreadChannel,
 } from 'discord.js'
-import { CAPABILITY, HarmonyClient, HarmonyHttpError, isAuthorOptedOut, isAutomodBlocked, isDiscordMessageTaken } from '../HarmonyClient.js'
+import { CAPABILITY, HarmonyClient, HarmonyHttpError, isAuthorOptedOut, isAutomodBlocked, isDiscordMessageTaken, isReplyOutOfScope } from '../HarmonyClient.js'
 import {
   MessageTranslator,
   collectHarmonyCustomEmoji,
@@ -43,7 +43,6 @@ import {
   formatHarmonyReplyForDiscord,
   isDiscordUserAlreadyMentioned,
   parseDiscordJumpLink,
-  stripDiscordJumpLinkLine,
   stripDiscordUserMentionPrefix,
 } from '../utils/replyFormatter.js'
 import { refreshDiscordAttachmentParts } from '../refreshAttachments.js'
@@ -64,7 +63,7 @@ import { ReactionLedger } from '../utils/reactionLedger.js'
 import { ServerEmojiLinks } from './serverEmojiLinks.js'
 import { ServerStickerLinks } from './serverStickerLinks.js'
 import { OptOutList } from './optOuts.js'
-import { isImportableMessage } from './historyImport.js'
+import { isImportableMessage, type ImportThreadStarter } from './historyImport.js'
 import { resolveDeliveryMode } from '../utils/deliveryMode.js'
 import type { FetchLike } from '../http.js'
 import { Logger, errorText } from '../log.js'
@@ -152,8 +151,11 @@ export interface RuntimeHooks {
   harmonyAuthHint?: string
   /** Log line explaining a Discord token rejection. */
   discordTokenHint?: string
-  /** Polls for history import jobs now (used by `/bridge import`). Set while the import scheduler runs. */
-  kickImports?: () => void
+  /**
+   * Polls for history import jobs now (used by `/bridge import`). Set while the import scheduler
+   * runs. `restarted`: jobs a person just started again; their waits and stall counts go.
+   */
+  kickImports?: (restarted?: string[]) => void
   /** History import routes for `/bridge import-history`. Absent on a bridge that may not import. */
   importApi?: Pick<BridgeApi, 'listImports' | 'startImports' | 'cancelImport'>
   /** `history_import.enabled` of the current configuration. */
@@ -191,10 +193,13 @@ interface DiscordEventSource {
 }
 
 /**
- * Message id mappings between Discord and Harmony, LRU-bounded. A dropped
- * mapping loses edit/delete/reaction bridging for that old message.
+ * Message id mappings between Discord and Harmony, LRU-bounded. A message missing from them is
+ * looked up on Harmony by its Discord id (harmonyCopyOf).
  */
 const MESSAGE_MAPPING_CAP = 50_000
+/** Discord ids Harmony holds no copy of, remembered this long: one lookup per reaction burst. */
+const LOOKUP_MISS_TTL_MS = 10 * 60 * 1000
+const LOOKUP_MISS_CAP = 10_000
 const HARMONY_USER_CACHE_REFRESH_MS = 5 * 60 * 1000
 /** rate_limited stays reported this long after the last drop. */
 const RATE_LIMIT_PROBLEM_MS = 5 * 60 * 1000
@@ -219,6 +224,8 @@ const DISCORD_UNKNOWN_WEBHOOK = 10015
 /** Discord subtext: the message a standalone thread started on Harmony hangs off. */
 const THREAD_ANCHOR_TEXT = '-# started a thread'
 const DISCORD_UNKNOWN_MESSAGE = 10008
+const DISCORD_UNKNOWN_MEMBER = 10007
+const DISCORD_UNKNOWN_USER = 10013
 const DISCORD_UNKNOWN_EMOJI = 10014
 const DISCORD_MISSING_PERMISSIONS = 50013
 const DISCORD_ENTITY_TOO_LARGE = 40005
@@ -313,6 +320,8 @@ export class BridgeRuntime {
   private memberListKey: string | null = null
   /** Guild id → the feature set its slash commands were last registered with. */
   private readonly registeredCommands = new Map<string, string>()
+  /** Guild id -> the registration PUT in flight and its feature key. */
+  private readonly commandRegistrations = new Map<string, { key: string; done: Promise<void> }>()
   private stopped = false
 
   readonly discordToHarmonyMessages = new BoundedMap<string, string>(MESSAGE_MAPPING_CAP)
@@ -327,6 +336,19 @@ export class BridgeRuntime {
   private readonly harmonyOriginCopies = new BoundedMap<string, true>(MESSAGE_MAPPING_CAP)
   /** Discord ids whose Harmony copy the bridge deleted; Harmony's MESSAGE_DELETE for them is an echo. */
   private readonly deletedFromDiscord = new BoundedMap<string, true>(10_000)
+  /** Discord id -> when Harmony's lookup found no copy of it. */
+  private readonly lookupMisses = new BoundedMap<string, number>(LOOKUP_MISS_CAP)
+  /** Discord id -> its lookup in flight; concurrent events of one message share it. */
+  private readonly copyLookups = new Map<string, Promise<string | null>>()
+  /** Harmony message id -> when getMessage found no Discord id on it. */
+  private readonly discordLookupMisses = new BoundedMap<string, number>(LOOKUP_MISS_CAP)
+  /** Harmony message id -> its getMessage in flight. */
+  private readonly discordLookups = new Map<string, Promise<string | null>>()
+  /**
+   * Discord id -> a delete or edit of the message that arrived while its relay send was in
+   * flight; applied once the send returns its Harmony id.
+   */
+  private readonly relaysInFlight = new Map<string, { deleted?: DiscordMessage | PartialMessage; edited?: DiscordMessage | PartialMessage }>()
   private readonly webhookCache = new Map<string, Webhook>()
   private readonly webhookPermissionWarned = new Set<string>()
   private readonly manageMessagesWarned = new Set<string>()
@@ -397,6 +419,7 @@ export class BridgeRuntime {
       harmony: this.harmony,
       harmonyMessageFor: (discordId, harmonyChannelId) => this.resolveParentHarmonyId(discordId, harmonyChannelId),
       discordMessageFor: (harmonyId, harmonyChannelId) => this.resolveParentDiscordId(harmonyId, harmonyChannelId),
+      forgetHarmonyMessage: harmonyId => this.forgetHarmonyMessage(harmonyId),
       threadStarter: thread => this.discordThreadStarter(thread),
       postAnchor: (parent, author) => this.postThreadAnchor(parent, author),
       log: this.log,
@@ -666,8 +689,8 @@ export class BridgeRuntime {
     events.on(Events.MessageReactionRemove, (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
       if (current()) void this.onDiscordReactionRemove(reaction, user)
     })
-    events.on(Events.MessageUpdate, (_old: unknown, msg: DiscordMessage | PartialMessage) => {
-      if (current()) void this.onDiscordMessageUpdate(msg)
+    events.on(Events.MessageUpdate, (old: DiscordMessage | PartialMessage | null, msg: DiscordMessage | PartialMessage) => {
+      if (current()) void this.onDiscordMessageUpdate(msg, old)
     })
     events.on(Events.MessageDelete, (msg: DiscordMessage | PartialMessage) => { if (current()) void this.onDiscordMessageDelete(msg) })
     events.on(Events.MessageBulkDelete, (messages: ReadonlyCollection<string, DiscordMessage | PartialMessage>) => {
@@ -737,7 +760,12 @@ export class BridgeRuntime {
       }
       if (this.commandGuildIds(client).includes(guild.id)) void this.registerCommandsFor(client, guild.id)
     })
-    events.on(Events.GuildDelete, () => { if (current()) this.notify('guilds') })
+    // A kick may take the guild's commands with it: a later invite registers them again.
+    events.on(Events.GuildDelete, (guild: { id: string }) => {
+      if (!current()) return
+      this.registeredCommands.delete(guild.id)
+      this.notify('guilds')
+    })
     events.on(Events.ChannelCreate, () => { if (current()) this.notify('channels') })
     events.on(Events.ChannelDelete, () => { if (current()) this.notify('channels') })
     events.on(Events.ChannelUpdate, () => { if (current()) this.notify('channels') })
@@ -760,7 +788,7 @@ export class BridgeRuntime {
         await this.runGuildStartup(client, guildId)
       }
       for (const guildId of this.commandGuildIds(client)) {
-        await this.registerCommandsFor(client, guildId)
+        if (client.guilds.cache.has(guildId)) await this.registerCommandsFor(client, guildId)
       }
 
       this.log.info(`Cached ${this.discordMemberDetails.size} Discord members for mention lookups`)
@@ -869,7 +897,7 @@ export class BridgeRuntime {
    * which drops the per-command permissions a server set on them. Discord keeps the previous
    * registration until the capability read, or READY, registers.
    */
-  private async registerCommandsFor(client: DiscordClient, guildId: string) {
+  private async registerCommandsFor(client: DiscordClient, guildId: string): Promise<void> {
     if (this.mode === 'v2' && !this.harmony.capabilitiesKnown()) {
       this.capabilityLoad ??= this.harmony.loadCapabilities()
         .then(() => this.refreshCommands())
@@ -880,19 +908,36 @@ export class BridgeRuntime {
     const features = this.commandFeatures()
     const key = JSON.stringify(features)
     if (this.registeredCommands.get(guildId) === key) return
-    try {
-      await registerSlashCommands(this, client, guildId, features)
-      this.registeredCommands.set(guildId, key)
-    } catch (err) {
-      this.log.error(`Slash command registration failed for guild ${guildId}: ${errorText(err)}`)
+    // One PUT per guild at a time; a caller with the same feature set shares it.
+    const running = this.commandRegistrations.get(guildId)
+    if (running) {
+      if (running.key === key) return running.done
+      await running.done
+      return this.registerCommandsFor(client, guildId)
     }
+    const done = (async () => {
+      try {
+        await registerSlashCommands(this, client, guildId, features)
+        this.registeredCommands.set(guildId, key)
+      } catch (err) {
+        this.log.error(`Slash command registration failed for guild ${guildId}: ${errorText(err)}`)
+      }
+    })().finally(() => {
+      if (this.commandRegistrations.get(guildId)?.done === done) this.commandRegistrations.delete(guildId)
+    })
+    this.commandRegistrations.set(guildId, { key, done })
+    return done
   }
 
   /** Registers commands again wherever the feature set changed: gateway capabilities, the import switch. */
   async refreshCommands(): Promise<void> {
     const client = this.discord
     if (!client || !this.discordReady || this.stopped) return
-    for (const guildId of this.commandGuildIds(client)) await this.registerCommandsFor(client, guildId)
+    // A guild the bot is not in answers 50001. Once the bot joins, GuildCreate registers there:
+    // commands alone for the bridge's own client, the whole guild startup for the instance bot.
+    for (const guildId of this.commandGuildIds(client)) {
+      if (client.guilds.cache.has(guildId)) await this.registerCommandsFor(client, guildId)
+    }
   }
 
   /**
@@ -968,6 +1013,104 @@ export class BridgeRuntime {
       } catch (err) {
         this.log.error(`Failed to restore mappings for ${channelId}: ${errorText(err)}`)
       }
+    }
+  }
+
+  /**
+   * The Harmony message of a Discord message: the mapping, else Harmony's lookup by Discord id.
+   * History import, a restart and the mapping cap leave messages unmapped. A Harmony original
+   * found this way is recorded as one (harmonyOriginCopies) like a mapped one.
+   */
+  private harmonyCopyOf(discordMessageId: string, harmonyChannelId: string, opts: { trustMiss?: boolean } = {}): Promise<string | null> {
+    const mapped = this.discordToHarmonyMessages.get(discordMessageId)
+    if (mapped) return Promise.resolve(mapped)
+    if (!this.indexedDiscordLookups()) return Promise.resolve(null)
+    if (opts.trustMiss !== false) {
+      const missedAt = this.lookupMisses.get(discordMessageId)
+      if (missedAt !== undefined && Date.now() - missedAt < LOOKUP_MISS_TTL_MS) return Promise.resolve(null)
+    }
+    let lookup = this.copyLookups.get(discordMessageId)
+    if (!lookup) {
+      lookup = this.lookupHarmonyCopy(discordMessageId, harmonyChannelId)
+        .finally(() => this.copyLookups.delete(discordMessageId))
+      this.copyLookups.set(discordMessageId, lookup)
+    }
+    return lookup
+  }
+
+  private async lookupHarmonyCopy(discordMessageId: string, harmonyChannelId: string): Promise<string | null> {
+    const found = await this.harmony.lookupMessageByDiscordId(harmonyChannelId, discordMessageId)
+    if (!found?.id) {
+      this.lookupMisses.set(discordMessageId, Date.now())
+      return null
+    }
+    this.lookupMisses.delete(discordMessageId)
+    if (found.metadata?.discord_message_id) this.rememberMapping(found)
+    this.discordToHarmonyMessages.set(discordMessageId, found.id)
+    return found.id
+  }
+
+  /**
+   * Whether Harmony's lookup by Discord id is index-backed (messages_channel_discord_message_id_unique,
+   * Harmony 1.9.7, whose gateway lists bridge_privacy). Harmony 1.9.6 reads the whole channel for
+   * it: there an unmapped message is left alone, as bridge 2.5 did.
+   */
+  private indexedDiscordLookups(): boolean {
+    return this.harmony.hasCapability(CAPABILITY.privacy)
+  }
+
+  /** History import stored these Discord messages: a miss remembered for them no longer holds. */
+  forgetLookupMisses(discordMessageIds: readonly string[]): void {
+    for (const id of discordMessageIds) this.lookupMisses.delete(id)
+  }
+
+  /**
+   * The Discord message of a Harmony message: the mapping, else the Discord id in the message's
+   * metadata (imported and old messages). Shared and remembered like harmonyCopyOf's lookups.
+   */
+  private discordCopyOf(harmonyMessageId: string): Promise<string | null> {
+    const mapped = this.harmonyToDiscordMessages.get(harmonyMessageId)
+    if (mapped) return Promise.resolve(mapped)
+    const missedAt = this.discordLookupMisses.get(harmonyMessageId)
+    if (missedAt !== undefined && Date.now() - missedAt < LOOKUP_MISS_TTL_MS) return Promise.resolve(null)
+    let lookup = this.discordLookups.get(harmonyMessageId)
+    if (!lookup) {
+      lookup = (async () => {
+        const message = await this.harmony.getMessage(harmonyMessageId)
+        if (!message?.id || !message.metadata?.discord_message_id) {
+          this.discordLookupMisses.set(harmonyMessageId, Date.now())
+          return null
+        }
+        this.rememberMapping(message)
+        return String(message.metadata.discord_message_id)
+      })().finally(() => this.discordLookups.delete(harmonyMessageId))
+      this.discordLookups.set(harmonyMessageId, lookup)
+    }
+    return lookup
+  }
+
+  /**
+   * Sends a relayed message. A reply Harmony refuses as out of scope names a mapped message that
+   * is gone (erased, purged) or in another channel (a re-paired channel, a jump link): the mapping
+   * is dropped and the message goes once more without the reply.
+   */
+  private async sendRelayed(channelId: string, parts: any[], metadata: unknown, replyTo: string | null, threadId: string | null): Promise<any> {
+    try {
+      return await this.harmony.sendMessage(channelId, parts, metadata, replyTo, threadId)
+    } catch (error) {
+      if (!replyTo || !isReplyOutOfScope(error)) throw error
+      this.log.debug(`Harmony refused reply parent ${replyTo}; sending without the reply`)
+      this.forgetHarmonyMessage(replyTo)
+      return this.harmony.sendMessage(channelId, parts, metadata, null, threadId)
+    }
+  }
+
+  /** Drops the mappings of a Harmony message id that no longer stands for that message. */
+  private forgetHarmonyMessage(harmonyMessageId: string): void {
+    const discordId = this.harmonyToDiscordMessages.get(harmonyMessageId)
+    this.harmonyToDiscordMessages.delete(harmonyMessageId)
+    if (discordId !== undefined && this.discordToHarmonyMessages.get(discordId) === harmonyMessageId) {
+      this.discordToHarmonyMessages.delete(discordId)
     }
   }
 
@@ -1610,7 +1753,6 @@ export class BridgeRuntime {
     else this.log.debug(line)
   }
 
-  /** Anti-spam drop of a Discord message: counted, logged without content. */
   /**
    * True for Harmony's refusal of an opted-out author (403 BRIDGE_AUTHOR_OPTED_OUT). The author
    * joins the list at once, so nothing more of theirs is sent before the list is read again.
@@ -1622,6 +1764,7 @@ export class BridgeRuntime {
     return true
   }
 
+  /** Anti-spam drop of a Discord message: counted, logged without content. */
   noteSpamDrop(reason: 'rate' | 'duplicate', channelId: string) {
     const { rate, duplicate } = this.antiSpam.dropped
     const total = rate + duplicate
@@ -1878,6 +2021,8 @@ export class BridgeRuntime {
     try {
       const parent = await this.harmony.lookupMessageByDiscordId(harmonyChannelId, discordParentId)
       if (parent?.id) {
+        // A Harmony original found here is recorded as one: deleting its Discord copy keeps it.
+        if (parent.metadata?.discord_message_id) this.rememberMapping(parent)
         this.discordToHarmonyMessages.set(discordParentId, parent.id)
         this.harmonyToDiscordMessages.set(parent.id, discordParentId)
         return parent.id
@@ -1890,6 +2035,7 @@ export class BridgeRuntime {
       const recent = await this.harmony.loadRecentMessages(harmonyChannelId, 100)
       const found = recent.find(m => m.metadata?.discord_message_id === discordParentId)
       if (found?.id) {
+        this.rememberMapping(found)
         this.discordToHarmonyMessages.set(discordParentId, found.id)
         this.harmonyToDiscordMessages.set(found.id, discordParentId)
         return found.id
@@ -1910,13 +2056,15 @@ export class BridgeRuntime {
     msg: DiscordMessage,
     harmonyChannelId: string,
   ): Promise<{ replyTo: string | null; cleanedContent: string }> {
-    let content = msg.content ?? ''
+    const original = msg.content ?? ''
+    let content = original
     const isForward = msg.reference?.type === REFERENCE_FORWARD
     let discordParentId = isForward ? null : (msg.reference?.messageId ?? null)
 
     if (!discordParentId && !isForward) {
+      // A leading jump link into this channel is a reply; one into another channel is a link.
       const parsed = parseDiscordJumpLink(content)
-      if (parsed) {
+      if (parsed && parsed.channelId === msg.channelId) {
         discordParentId = parsed.messageId
         content = content.slice(parsed.consumedLength).trimStart()
       }
@@ -1928,17 +2076,27 @@ export class BridgeRuntime {
 
     const replyTo = await this.resolveParentHarmonyId(discordParentId, harmonyChannelId)
     if (!replyTo) {
+      // A leading jump link to a message Harmony does not hold is the member's own text.
       this.log.debug(`Discord reply parent ${discordParentId} not mapped; sending as plain message`)
-      return { replyTo: null, cleanedContent: content }
+      return { replyTo: null, cleanedContent: original }
     }
 
-    content = stripDiscordJumpLinkLine(content)
+    // A native reply that starts with a link to its own parent repeats the reply; the jump-link
+    // path above already took its one line. A link to any other message is the member's text.
+    if (msg.reference?.messageId === discordParentId) {
+      const lead = parseDiscordJumpLink(content)
+      if (lead && lead.channelId === msg.channelId && lead.messageId === discordParentId) {
+        content = content.slice(lead.consumedLength).trimStart()
+      }
+    }
 
     const repliedUserId = msg.mentions.repliedUser?.id
     if (repliedUserId) {
       content = stripDiscordUserMentionPrefix(content, repliedUserId)
     }
 
+    // Stripping never leaves a message with text empty: the reply keeps what the member wrote.
+    if (content.trim() === '' && original.trim() !== '') content = original
     return { replyTo, cleanedContent: content }
   }
 
@@ -1970,11 +2128,30 @@ export class BridgeRuntime {
   }
 
   /**
-   * The discord_user of the member who started a Discord thread (history import). Null for the
-   * bridge's own threads and a starter who left the guild; `{ id }` alone for one who opted out.
+   * The starter of a Discord thread, for history import. No user for the bridge's own threads and
+   * a starter who left the guild, `{ id }` alone for one who opted out; the thread of either of the
+   * last two is imported as 'Thread'. Rejects when Discord could not answer whether the starter is
+   * a member, so the importer retries.
    */
-  threadStarterForImport(thread: { id: string; ownerId: string | null }): Promise<Record<string, unknown> | null> {
-    return this.discordThreadStarter(thread)
+  async threadStarterForImport(thread: { id: string; ownerId: string | null }): Promise<ImportThreadStarter> {
+    const ownerId = thread.ownerId
+    if (!ownerId || ownerId === this.discord?.user?.id) return { discordUser: null, plainTitle: false }
+    if (this.optOuts.has(ownerId)) return { discordUser: { id: ownerId }, plainTitle: true }
+    const guild = (thread as Partial<AnyThreadChannel>).guild
+    if (!guild) return { discordUser: null, plainTitle: false }
+    let member: GuildMember | null
+    try {
+      member = await guild.members.fetch(ownerId)
+    } catch (error) {
+      const code = discordCode(error)
+      if (code === DISCORD_UNKNOWN_MEMBER || code === DISCORD_UNKNOWN_USER) return { discordUser: null, plainTitle: true }
+      throw error
+    }
+    if (!member?.user) return { discordUser: null, plainTitle: true }
+    return {
+      discordUser: buildDiscordUserMetadata(member.user, member, this.discordMemberDetails.get(ownerId)).discord_user,
+      plainTitle: false,
+    }
   }
 
   /**
@@ -2095,6 +2272,11 @@ export class BridgeRuntime {
       return
     }
 
+    const held: { deleted?: DiscordMessage | PartialMessage; edited?: DiscordMessage | PartialMessage } = {}
+    this.relaysInFlight.set(msg.id, held)
+    let relayed = false
+    // A send that threw may still have been stored: the gateway finishes a request the bridge gave up on.
+    let maybeStored = false
     try {
       const { replyTo, cleanedContent } = await this.resolveDiscordReplyToHarmony(msg, harmonyChannelId)
 
@@ -2126,14 +2308,20 @@ export class BridgeRuntime {
         return
       }
 
+      if (held.deleted) {
+        this.log.debug(`Discord message ${msg.id} was deleted before its relay was sent; not relayed`)
+        return
+      }
+      maybeStored = true
       const result = await this.withStickerFallback(stickerServerId, firstParts, buildParts, parts =>
-        this.harmony.sendMessage(harmonyChannelId, parts, metadata, replyTo, harmonyThreadId))
+        this.sendRelayed(harmonyChannelId, parts, metadata, replyTo, harmonyThreadId))
 
       // The gateway returns the message at top level (BotRestAPI.formatMessage).
       const harmonyMessageId = result?.id ?? result?.message?.id
       if (harmonyMessageId) {
         this.discordToHarmonyMessages.set(msg.id, harmonyMessageId)
         this.harmonyToDiscordMessages.set(harmonyMessageId, msg.id)
+        relayed = true
       } else {
         this.log.warn(`Bridged message returned no id; reaction/edit/delete sync skipped for Discord ${msg.id}`)
       }
@@ -2152,7 +2340,14 @@ export class BridgeRuntime {
       if (!this.noteDrop('Discord → Harmony', error)) {
         this.log.error(`Failed to bridge Discord → Harmony (${msg.id}): ${errorText(error)}`)
       }
+    } finally {
+      if (this.relaysInFlight.get(msg.id) === held) this.relaysInFlight.delete(msg.id)
     }
+    if (!relayed && !maybeStored) return
+    // A delete wins over an edit that arrived before it. After a failed send both go through
+    // Harmony's lookup, which finds a row the gateway stored after the bridge gave up.
+    if (held.deleted) await this.onDiscordMessageDelete(held.deleted)
+    else if (held.edited) await this.onDiscordMessageUpdate(held.edited, null, { trustMiss: false })
   }
 
   /** Reaction emoji for Harmony; a custom emoji carries its CDN URL (`.gif` when animated). */
@@ -2194,9 +2389,9 @@ export class BridgeRuntime {
     if (this.optOuts.has(user.id)) return
 
     try {
-      const harmonyMessageId = this.discordToHarmonyMessages.get(reaction.message.id)
+      const harmonyMessageId = await this.harmonyCopyOf(reaction.message.id, harmonyChannelId)
       if (!harmonyMessageId) {
-        this.log.debug(`No message mapping for Discord message ${reaction.message.id}`)
+        this.log.debug(`No Harmony copy of Discord message ${reaction.message.id}`)
         return
       }
 
@@ -2243,9 +2438,9 @@ export class BridgeRuntime {
     if (!this.settings().syncReactions) return
 
     try {
-      const harmonyMessageId = this.discordToHarmonyMessages.get(reaction.message.id)
+      const harmonyMessageId = await this.harmonyCopyOf(reaction.message.id, harmonyChannelId)
       if (!harmonyMessageId) {
-        this.log.debug(`No message mapping for Discord message ${reaction.message.id}`)
+        this.log.debug(`No Harmony copy of Discord message ${reaction.message.id}`)
         return
       }
 
@@ -2265,20 +2460,37 @@ export class BridgeRuntime {
     }
   }
 
-  private async onDiscordMessageUpdate(newMsg: DiscordMessage | PartialMessage) {
+  /**
+   * Relays an edit. Discord sends MESSAGE_UPDATE for more than edits (a thread started on the
+   * message, embeds resolved, a pin); only a message whose editedTimestamp is set, and changed
+   * when the old message is cached, is an edit. An update of a message edited earlier whose old
+   * version is not cached still goes as an edit, with the content Discord holds.
+   */
+  private async onDiscordMessageUpdate(
+    newMsg: DiscordMessage | PartialMessage,
+    oldMsg?: DiscordMessage | PartialMessage | null,
+    lookup: { trustMiss?: boolean } = {},
+  ) {
     if (!this.settings().syncEdits) return
     if (!newMsg.author || newMsg.author.bot) return
+    if (!newMsg.editedTimestamp) return
+    if (oldMsg && !oldMsg.partial && oldMsg.editedTimestamp === newMsg.editedTimestamp && oldMsg.content === newMsg.content) return
 
     if (isPrivateThread(newMsg.channel)) return
     const updatePairId = this.discordPairId(newMsg.channelId, newMsg.channel)
     const harmonyChannelId = this.dir.getHarmonyChannel(updatePairId)
     if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(updatePairId)) return
     if (this.optOuts.has(newMsg.author.id)) return
+    const inFlight = this.relaysInFlight.get(newMsg.id)
+    if (inFlight) {
+      inFlight.edited = newMsg
+      return
+    }
 
     try {
-      const harmonyMessageId = this.discordToHarmonyMessages.get(newMsg.id)
+      const harmonyMessageId = await this.harmonyCopyOf(newMsg.id, harmonyChannelId, lookup)
       if (!harmonyMessageId) {
-        this.log.debug(`No message mapping for Discord message ${newMsg.id}`)
+        this.log.debug(`No Harmony copy of Discord message ${newMsg.id}`)
         return
       }
 
@@ -2328,16 +2540,34 @@ export class BridgeRuntime {
     if (msg.author?.bot || msg.webhookId) return false
     if (this.harmonyOriginCopies.has(msg.id)) return false
 
-    if (isPrivateThread(msg.channel)) return false
+    // Private threads are not relayed; a copy bridge 2.5 relayed from one is still deleted.
     const deletePairId = this.discordPairId(msg.channelId, msg.channel)
     const harmonyChannelId = this.dir.getHarmonyChannel(deletePairId)
     if (!harmonyChannelId || !this.dir.shouldBridgeFromDiscord(deletePairId)) return false
 
-    const harmonyMessageId = this.discordToHarmonyMessages.get(msg.id)
-    if (!harmonyMessageId) {
-      this.log.debug(`No message mapping for Discord message ${msg.id}`)
+    const inFlight = this.relaysInFlight.get(msg.id)
+    if (inFlight) {
+      inFlight.deleted = msg
+      this.log.debug(`Discord message ${msg.id} deleted while its relay is in flight; deleted once it returns`)
       return false
     }
+
+    // A delete always asks Harmony: a remembered miss may predate the copy (history import).
+    let harmonyMessageId: string | null
+    try {
+      harmonyMessageId = await this.harmonyCopyOf(msg.id, harmonyChannelId, { trustMiss: false })
+    } catch (error) {
+      if (!this.noteDrop('Discord → Harmony delete', error)) {
+        this.log.error(`Failed to look up the Harmony copy of Discord message ${msg.id}: ${errorText(error)}`)
+      }
+      return false
+    }
+    if (!harmonyMessageId) {
+      this.log.debug(`No Harmony copy of Discord message ${msg.id}`)
+      return false
+    }
+    // An uncached Discord copy of a Harmony message is known only once the lookup names it.
+    if (this.harmonyOriginCopies.has(msg.id)) return false
 
     try {
       this.deletedFromDiscord.set(msg.id, true)
@@ -2941,9 +3171,15 @@ export class BridgeRuntime {
     const discordChannelId = this.dir.getDiscordChannel(data.channel_id)
     if (!discordChannelId || !this.dir.shouldBridgeFromHarmony(data.channel_id)) return
 
-    const discordMessageId = this.harmonyToDiscordMessages.get(data.message_id)
+    let discordMessageId: string | null
+    try {
+      discordMessageId = await this.discordCopyOf(String(data.message_id))
+    } catch (err) {
+      this.log.error(`Failed to look up the Discord copy of Harmony message ${data.message_id}: ${errorText(err)}`)
+      return
+    }
     if (!discordMessageId) {
-      this.log.debug(`Harmony reaction: no Discord mapping for ${data.message_id}`)
+      this.log.debug(`Harmony reaction: no Discord message for ${data.message_id}`)
       return
     }
 
@@ -3001,11 +3237,22 @@ export class BridgeRuntime {
 
     const discordChannelId = this.dir.getDiscordChannel(data.channel_id)
     if (!discordChannelId || !this.dir.shouldBridgeFromHarmony(data.channel_id)) return
+    // Only a reaction this process mirrored has a Discord reaction to take back.
+    if (!data.reaction_id || !this.reactionLedger.has(String(data.reaction_id))) {
+      this.log.debug(`Harmony reaction removal ${data.reaction_id ?? '?'}: not tracked; Discord reaction kept`)
+      return
+    }
 
-    const discordMessageId = this.harmonyToDiscordMessages.get(data.message_id)
+    let discordMessageId: string | null
+    try {
+      discordMessageId = await this.discordCopyOf(String(data.message_id))
+    } catch (err) {
+      this.log.error(`Failed to look up the Discord copy of Harmony message ${data.message_id}: ${errorText(err)}`)
+      return
+    }
     if (!discordMessageId) return
 
-    const known = data.reaction_id ? this.reactionLedger.remove(String(data.reaction_id)) : null
+    const known = this.reactionLedger.remove(String(data.reaction_id))
     if (!known) {
       this.log.debug(`Harmony reaction removal ${data.reaction_id ?? '?'}: not tracked; Discord reaction kept`)
       return

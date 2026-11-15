@@ -27,6 +27,8 @@ export interface ImportThreadLike {
   locked: boolean | null
   /** Discord channel type; private threads (12) are never imported. */
   type?: number
+  /** When Discord last archived the thread, in ms. */
+  archiveTimestamp?: number | null
 }
 
 export interface ThreadListPage {
@@ -35,6 +37,16 @@ export interface ThreadListPage {
   next: Record<string, unknown> | null
   /** Private threads left out of this page (they never cross the bridge). */
   skippedPrivate?: number
+}
+
+/**
+ * The starter of an imported thread. `discordUser`: Harmony's discord_user, or null. `plainTitle`:
+ * Discord titles a thread with its starter's words, so the thread of a starter who left the guild
+ * or opted out is imported as 'Thread'.
+ */
+export interface ImportThreadStarter {
+  discordUser: Record<string, unknown> | null
+  plainTitle: boolean
 }
 
 /** An import row before the importer adds its thread and pin. */
@@ -65,8 +77,10 @@ export interface HistoryImporterDeps {
   listThreads(channelId: string, cursor: Record<string, unknown> | null): Promise<ThreadListPage>
   /** Whether the thread was started from a message of the channel, i.e. a message with the thread's id exists. */
   hasStarterMessage(channelId: string, threadId: string): Promise<boolean>
-  /** The Harmony discord_user of the member who started the thread, or null. */
-  threadStarter(thread: ImportThreadLike): Promise<Record<string, unknown> | null>
+  /** A thread of the channel by id; null when it is gone, private or another channel's. */
+  fetchThread?(channelId: string, threadId: string): Promise<ImportThreadLike | null>
+  /** Who started the thread, as Harmony gets it. Rejects when Discord could not say. */
+  threadStarter(thread: ImportThreadLike): Promise<ImportThreadStarter>
   /** Opted-out Discord users of the server. Absent on a gateway without the privacy routes. */
   optOuts?: {
     /** Reads the list from Harmony. A run does not start on a list it could not read. */
@@ -76,6 +90,8 @@ export interface HistoryImporterDeps {
   }
   /** Harmony refused the native part of this Harmony sticker in a batch. */
   onStickerRefused?(harmonyStickerId: string): void
+  /** Discord messages Harmony now holds: the relay's remembered lookup misses for them go. */
+  onImported?(discordMessageIds: string[]): void
   /** Raises a problem (shown in /bridge status and reported to Harmony). */
   reportProblem(problem: Problem): void
   pageDelayMs: number
@@ -91,7 +107,25 @@ interface ThreadProgress {
   at: Record<string, unknown> | null
   /** Ids of the threads of that page already imported. */
   done: string[]
+  /** Ids of the threads the first page listed as active. Absent on a cursor of an earlier build. */
+  active?: string[]
+  /** When the first page was listed (ISO). Absent on a cursor of an earlier build. */
+  since?: string
+  /** The thread being walked and the oldest of its messages posted, to resume below it. */
+  current?: { id: string; before: string }
+  /** Threads walked outside their archived page (a resume, the active page); later pages skip them. */
+  finished?: string[]
 }
+
+/**
+ * The cursors of the pass after the archived threads, for threads revived while those were
+ * paged: the active ones the first page did not list, then (`archived`) public threads archived
+ * since the first listing, newest first, from `before`.
+ */
+const RECHECK_CURSOR = { list: 'recheck' } as const
+type RecheckCursor = { list: 'recheck'; archived?: boolean; before?: string | null }
+
+const stringIds = (v: unknown): string[] => (Array.isArray(v) ? v.filter((id): id is string => typeof id === 'string') : [])
 
 /** State of one run() call. */
 interface Run {
@@ -247,7 +281,8 @@ export class HistoryImporter {
         state.phase = 'replies'
       }
       await this.harmonyCall(run, () => this.deps.api.linkImportReplies(state.id, { signal }))
-      await this.patch(run, { state: 'done' })
+      // A finished job's thread cursor is never read again: a new run starts over.
+      await this.patch(run, { state: 'done', thread_cursor: null })
       return { result: 'done' }
     } catch (error) {
       if (error instanceof Stop) return { result: error.result, ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}) }
@@ -277,47 +312,111 @@ export class HistoryImporter {
     const { log } = this.deps
     const job = run.job
     const channelId = job.discord_channel_id
-    const saved = job.thread_cursor as { at?: Record<string, unknown> | null; done?: unknown } | null
-    let at = saved?.at ?? null
+    const saved = job.thread_cursor as Partial<Record<keyof ThreadProgress, unknown>> | null
+    let at = (saved?.at ?? null) as Record<string, unknown> | null
     // By id, not by position: a thread archived between runs shifts the list. A count saved by
     // an earlier build restarts its page; the server answers the repeats as skipped.
-    let done = new Set<string>(Array.isArray(saved?.done) ? saved.done.filter((id): id is string => typeof id === 'string') : [])
+    let done = new Set<string>(stringIds(saved?.done))
+    // A cursor saved by an earlier build holds no active list: its job has no last pass.
+    let active: string[] | null = Array.isArray(saved?.active) ? stringIds(saved.active) : at === null ? [] : null
+    let since = typeof saved?.since === 'string' ? saved.since : null
+    const finished = new Set<string>(stringIds(saved?.finished))
+    const savedCurrent = saved?.current as { id?: unknown; before?: unknown } | null | undefined
+    let current = typeof savedCurrent?.id === 'string' && typeof savedCurrent.before === 'string'
+      ? { id: savedCurrent.id, before: savedCurrent.before }
+      : null
     let threadsDone = job.threads_done
     let skippedPrivate = 0
 
+    const progress = (over: Partial<ThreadProgress> = {}): ThreadProgress => ({
+      at,
+      done: [...done],
+      ...(active ? { active } : {}),
+      ...(since ? { since } : {}),
+      ...(finished.size > 0 ? { finished: [...finished] } : {}),
+      ...over,
+    })
+    const walkedFor = (threadId: string) => async (before: string) => {
+      await this.patch(run, { thread_cursor: { ...progress({ current: { id: threadId, before } }) }, ...this.skippedPatch(run) })
+      run.authorsSkippedSent = run.authorsSkipped
+    }
+    const walk = async (thread: ImportThreadLike, resumeBefore: string | null): Promise<void> => {
+      try {
+        await this.importThread(run, thread, resumeBefore, walkedFor(thread.id))
+      } catch (error) {
+        if (!(error instanceof ThreadSkip)) throw error
+        run.threadsSkipped++
+        log.warn(`History import ${job.id}: skipping thread ${thread.id} (${error.reason}); ${run.threadsSkipped} skipped so far`)
+      }
+    }
+
+    // An earlier run stopped inside a thread: it is finished first, wherever a listing now puts it.
+    if (current && this.deps.fetchThread) {
+      const resume = current
+      const thread = await this.discordCall(run, () => this.deps.fetchThread!(channelId, resume.id))
+      if (thread) {
+        await walk(thread, resume.before)
+        threadsDone++
+        finished.add(thread.id)
+      }
+      current = null
+      await this.patch(run, { threads_done: threadsDone, thread_cursor: { ...progress() }, ...this.skippedPatch(run) })
+      run.authorsSkippedSent = run.authorsSkipped
+    }
+
     for (;;) {
       await this.checkAbort(run)
-      const { threads, next, skippedPrivate: privateOnPage } = await this.discordCall(run, () => this.deps.listThreads(channelId, at))
-      skippedPrivate += privateOnPage ?? 0
-      const remaining = threads.filter(t => !done.has(t.id))
+      const recheck = at?.list === RECHECK_CURSOR.list ? at as RecheckCursor : null
+      const listCursor = !recheck ? at : recheck.archived ? { list: 'public', before: recheck.before ?? null } : null
+      const listed = await this.discordCall(run, () => this.deps.listThreads(channelId, listCursor))
+      let threads = listed.threads
+      if (recheck) {
+        // Threads started after the cutoff are the live relay's.
+        const first = new Set(active ?? [])
+        const sinceMs = since ? Date.parse(since) : null
+        threads = threads.filter(t => !first.has(t.id) && !newer(t.id, run.cutoff)
+          && (!recheck.archived || sinceMs === null || (t.archiveTimestamp ?? Infinity) > sinceMs))
+      } else {
+        skippedPrivate += listed.skippedPrivate ?? 0
+        if (at === null) {
+          // A resumed first page keeps the first listing's threads and time.
+          active = [...new Set([...(active ?? []), ...threads.map(t => t.id)])]
+          since ??= new Date(this.now()).toISOString()
+        }
+      }
+      let following: Record<string, unknown> | null
+      if (!recheck) following = listed.next ?? (active ? RECHECK_CURSOR : null)
+      else if (!recheck.archived) following = since ? { list: 'recheck', archived: true, before: null } : null
+      else {
+        const nextBefore = typeof listed.next?.before === 'string' ? listed.next.before : null
+        following = nextBefore && since && nextBefore > since ? { list: 'recheck', archived: true, before: nextBefore } : null
+      }
+      const remaining = threads.filter(t => !done.has(t.id) && !finished.has(t.id))
       // A lower bound until the last page is listed.
       const total = threadsDone + remaining.length
-      if (job.threads_total !== total && (!next || total > (job.threads_total ?? 0))) {
+      if (job.threads_total !== total && (!following || total > (job.threads_total ?? 0))) {
         await this.patch(run, { threads_total: total })
         job.threads_total = total
       }
 
       for (const [i, thread] of remaining.entries()) {
-        try {
-          await this.importThread(run, thread)
-        } catch (error) {
-          if (!(error instanceof ThreadSkip)) throw error
-          run.threadsSkipped++
-          log.warn(`History import ${job.id}: skipping thread ${thread.id} (${error.reason}); ${run.threadsSkipped} skipped so far`)
-        }
+        await walk(thread, null)
         threadsDone++
         done.add(thread.id)
-        const progress: ThreadProgress = i === remaining.length - 1 && next ? { at: next, done: [] } : { at, done: [...done] }
+        // A thread of the active page archives during the import and is listed again among the
+        // archived ones: finished keeps it from being walked twice.
+        if (at === null) finished.add(thread.id)
+        const last = i === remaining.length - 1 && following
         await this.patch(run, {
           threads_done: threadsDone,
-          thread_cursor: { ...progress },
-          ...(run.authorsSkipped !== run.authorsSkippedSent ? { authors_skipped: run.authorsSkipped } : {}),
+          thread_cursor: { ...(last ? progress({ at: following, done: [] }) : progress()) },
+          ...this.skippedPatch(run),
         })
         run.authorsSkippedSent = run.authorsSkipped
         await this.pageWait(run)
         await this.checkServerState(run)
       }
-      if (!next) {
+      if (!following) {
         if (skippedPrivate > 0) {
           log.warn(`History import ${job.id}: left out ${skippedPrivate} private thread(s) of ${channelId}`)
           this.deps.reportProblem({ code: 'private_threads_skipped', params: { discord_channel_id: channelId, count: String(skippedPrivate) } })
@@ -327,27 +426,41 @@ export class HistoryImporter {
         }
         return
       }
-      at = next
+      at = following
       done = new Set()
     }
   }
 
-  private async importThread(run: Run, thread: ImportThreadLike): Promise<void> {
+  /** The skip count, when it changed since the last PATCH that carried it. */
+  private skippedPatch(run: Run): { authors_skipped?: number } {
+    return run.authorsSkipped !== run.authorsSkippedSent ? { authors_skipped: run.authorsSkipped } : {}
+  }
+
+  /**
+   * Imports one thread. `resumeBefore`: the walk of an earlier run stopped below this message.
+   * `walked` records each page's oldest message.
+   */
+  private async importThread(
+    run: Run,
+    thread: ImportThreadLike,
+    resumeBefore: string | null,
+    walked: (before: string) => Promise<void>,
+  ): Promise<void> {
     if (isPrivateThread(thread)) return
     const { job, signal } = run
     const channelId = job.discord_channel_id
     // A read of the parent channel: losing access there ends the job, not this thread.
     const hasStarter = await this.discordCall(run, () => this.deps.hasStarterMessage(channelId, thread.id))
-    const discordUser = await this.deps.threadStarter(thread).catch(() => null) ?? null
+    const starter = await this.discordCall(run, () => this.deps.threadStarter(thread))
     const invalidThread = (e: BridgeApiError) => e.status === 400 && e.code === 'invalid_thread'
     let harmonyThreadId: string
     try {
       harmonyThreadId = await this.harmonyCall(run, () => this.deps.api.importThread(job.id, {
         discord_thread_id: thread.id,
-        name: threadName(thread.name),
+        name: starter.plainTitle ? 'Thread' : threadName(thread.name),
         created_at: (thread.createdAt ?? snowflakeTime(thread.id)).toISOString(),
         starter_discord_message_id: hasStarter ? thread.id : null,
-        discord_user: discordUser,
+        discord_user: starter.discordUser,
         archived: thread.archived ?? false,
         locked: thread.locked ?? false,
       }, { signal }), invalidThread)
@@ -355,23 +468,30 @@ export class HistoryImporter {
       if (error instanceof BridgeApiError && invalidThread(error)) throw new ThreadSkip('Harmony refused the thread')
       throw error
     }
-    // Each thread restarts below the recency cutoff; the server dedupes, so a repeat is safe.
-    await this.importPages(run, { discordId: thread.id, harmonyThreadId, pins: NO_PINS }, true)
+    // A thread starts below the recency cutoff, or below where an earlier run's walk stopped.
+    await this.importPages(run, { discordId: thread.id, harmonyThreadId, pins: NO_PINS, resumeBefore, walked }, true)
   }
 
   /**
    * Pages through a channel's (thread's) history, newest first, posting batches. The walk starts
-   * below the recency cutoff. For the channel itself (no harmonyThreadId) the job's start and
-   * reached markers are kept; threads restart from the cutoff every time.
+   * below the recency cutoff, or below the channel's reached marker or the thread's
+   * `resumeBefore`. For the channel itself (no harmonyThreadId) the job's start and reached
+   * markers are kept; a thread's position goes to `walked`, which records it in thread_cursor.
    */
   private async importPages(
     run: Run,
-    scope: { discordId: string; harmonyThreadId: string | null; pins: ReadonlySet<string> },
+    scope: {
+      discordId: string
+      harmonyThreadId: string | null
+      pins: ReadonlySet<string>
+      resumeBefore?: string | null
+      walked?: (before: string) => Promise<void>
+    },
     skipOnLostAccess = false,
   ): Promise<void> {
     const job = run.job
     const isChannel = scope.harmonyThreadId === null
-    let before = (isChannel ? job.reached_discord_message_id : null) ?? run.cutoff
+    let before = (isChannel ? job.reached_discord_message_id : scope.resumeBefore) ?? run.cutoff
 
     for (;;) {
       await this.checkAbort(run)
@@ -396,12 +516,13 @@ export class HistoryImporter {
       await this.importPage(run, old, scope)
 
       const oldest = page[page.length - 1]
-      const skipped = run.authorsSkipped !== run.authorsSkippedSent ? { authors_skipped: run.authorsSkipped } : {}
       if (isChannel) {
         const reached = { reached_discord_message_id: oldest.id, reached_at: oldest.createdAt.toISOString() }
-        await this.patch(run, { ...reached, ...skipped })
+        await this.patch(run, { ...reached, ...this.skippedPatch(run) })
         Object.assign(job, reached)
         run.authorsSkippedSent = run.authorsSkipped
+      } else {
+        await scope.walked?.(oldest.id)
       }
       before = oldest.id
 
@@ -458,14 +579,14 @@ export class HistoryImporter {
     }
 
     // A message Harmony refuses with a native sticker part is sent once more with the sticker as
-    // its image, as the live relay does. Any other refusal is final.
-    const asImage = new Set<string>()
+    // its image, as the live relay does. Any other refusal is final. A refusal does not say which
+    // part it was for: the live link is forgotten once the image version is stored.
+    const asImage = new Map<string, string | null>()
     const withImage = async (refused: ImportMessage): Promise<ImportMessage | null> => {
       const sticker = hasNativeSticker(refused)
       const source = sources.get(refused.discord_message_id)
       if (!sticker || !source || asImage.has(refused.discord_message_id)) return null
-      asImage.add(refused.discord_message_id)
-      if (typeof sticker.id === 'string') this.deps.onStickerRefused?.(sticker.id)
+      asImage.set(refused.discord_message_id, typeof sticker.id === 'string' ? sticker.id : null)
       return build(source.msg, source.member, false).catch(() => null)
     }
 
@@ -486,6 +607,14 @@ export class HistoryImporter {
         pending = pending.flatMap(m => (m !== bad ? [m] : again ? [again] : []))
         continue
       }
+
+      for (const stored of result.inserted) {
+        const stickerId = asImage.get(stored.discord_message_id)
+        if (stickerId) this.deps.onStickerRefused?.(stickerId)
+      }
+      // Skipped ids may be stored too: a batch the bridge timed out on and the gateway committed.
+      const answered = [...result.inserted.map(r => r.discord_message_id), ...result.skipped]
+      if (answered.length > 0) this.deps.onImported?.(answered)
 
       const resend: ImportMessage[] = []
       const reasons = new Map<string, number>()
@@ -570,11 +699,13 @@ export class HistoryImporter {
     return result
   }
 
-  /** A PATCH of the skip count when the job has had none for KEEPALIVE_MS; it changes no state. */
+  /**
+   * A PATCH of the skip count last sent when the job has had none for KEEPALIVE_MS: it changes no
+   * state and no count. A partial count of a thread would be counted again by a resumed walk.
+   */
   private async keepAlive(run: Run): Promise<void> {
     if (this.now() - run.lastPatchAt < KEEPALIVE_MS) return
-    await this.patch(run, { authors_skipped: run.authorsSkipped })
-    run.authorsSkippedSent = run.authorsSkipped
+    await this.patch(run, { authors_skipped: run.authorsSkippedSent })
   }
 
   /**

@@ -285,18 +285,25 @@ an instance upgrade the new commands appear on the bridge's next connection.
 | `mirror` | Merge, and removes what the bridge copied from a Discord item that has since been deleted there. Asks Confirm/Cancel first (60 s, only you can press), listing every removal. |
 | `add` | Only adds what is new. |
 
-- **A member's upload is never touched.** No mode removes or replaces an emoji,
-  sticker or sound that someone uploaded on Harmony. When it has the name of a
-  Discord one, the run lists a name clash and leaves both as they are: rename
-  or delete the Harmony one to take Discord's.
+- **A member's upload is never removed or replaced.** No mode removes or
+  replaces an emoji, sticker or sound that someone uploaded on Harmony. When it
+  has the name of a Discord one, the run lists a name clash and leaves both as
+  they are: rename or delete the Harmony one to take Discord's. A member's emoji
+  that `/bridge import-emojis` linked to a Discord emoji by name before 2.6.0 is
+  renamed when the Discord emoji is.
+- **Nothing follows Discord on its own.** A sticker, emoji or sound deleted on
+  Discord stays on Harmony until someone runs the sync with `mode:mirror`.
 - **What a person removed stays removed.** An emoji a Harmony moderator removed
   is not restored; one the bridge itself removed (mirror) comes back when the
   Discord emoji still exists.
 - Harmony enforces both rules as well and the bridge reports its refusals as
   "kept", not as failures.
-- Removed emoji stay in old messages, and an instance administrator can restore
-  them. A removed sticker leaves the sticker list; old messages keep showing
-  it. A removed sound is deleted.
+- Removed emoji keep showing in old messages, and an instance administrator can
+  restore them. A removed sticker leaves the sticker list; old messages keep
+  showing it. Harmony keeps the 500 emoji and 60 stickers removed last and
+  deletes older ones with their images. A removed sound is deleted.
+- An emoji a person restored after the bridge removed it stays: mirror does
+  not remove it again.
 - `dry_run` lists the changes and makes none.
 - Two Discord emoji or stickers with the same name (ignoring case): the older
   one is copied, the other is listed as skipped.
@@ -605,9 +612,13 @@ rarely granted).
   with a growing delay and reports `rate_limited`.
 - Messages over 2000 characters are split at line breaks or spaces; code
   blocks are closed and reopened across the split.
-- Edits and deletions after a restart use the Discord ids stored in the
-  Harmony message metadata (`discord_message_id`, `discord_message_ids`,
-  `discord_via_webhook`).
+- Edits, deletions and reactions on a message the bridge did not relay in this
+  run (an imported one, or one from before a restart) are matched by the
+  Discord ids stored in the Harmony message metadata (`discord_message_id`,
+  `discord_message_ids`, `discord_via_webhook`), both ways, on Harmony 1.9.7 or
+  later. On an older Harmony only messages relayed in this run follow.
+- A Discord update that is not an edit (a thread started on the message,
+  embeds loaded, a pin) is not relayed as one.
 - A Harmony reaction shows as one bot reaction on Discord; it is removed when
   the last Harmony user removes theirs.
 - Rate-limited requests are retried within bounds (`Retry-After`, at most 60 s

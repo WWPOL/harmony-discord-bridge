@@ -249,6 +249,40 @@ describe('ImportScheduler', () => {
     await scheduler.stop()
   })
 
+  it('runs a job a person started again at once, its wait and stall count cleared', async () => {
+    const jobs = [job('a', { state: 'paused', reached_discord_message_id: '5' })]
+    const updateImport = vi.fn(async () => job('a'))
+    const { scheduler, calls } = make(() => jobs, { api: apiOf(() => jobs, updateImport) })
+    scheduler.arm()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    calls[0].release('paused')
+    await new Promise(r => setTimeout(r, 5))
+    scheduler.kick()
+    await new Promise(r => setTimeout(r, 5))
+    // Inside the first backoff wait: nothing runs.
+    expect(calls).toHaveLength(1)
+    scheduler.restart(['a'])
+    await vi.waitFor(() => expect(calls).toHaveLength(2))
+    calls[1].release('paused')
+    await new Promise(r => setTimeout(r, 5))
+    expect((scheduler as any).stalls.get('a').count).toBe(1)
+    await scheduler.stop()
+  })
+
+  it('treats a paused job queued again by a person as started again', async () => {
+    const jobs = [job('a', { state: 'paused', reached_discord_message_id: '5' })]
+    const updateImport = vi.fn(async () => job('a'))
+    const { scheduler, calls } = make(() => jobs, { api: apiOf(() => jobs, updateImport) })
+    scheduler.arm()
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    calls[0].release('paused')
+    await new Promise(r => setTimeout(r, 5))
+    jobs[0] = { ...jobs[0], state: 'queued' }
+    scheduler.kick()
+    await vi.waitFor(() => expect(calls).toHaveLength(2))
+    await scheduler.stop()
+  })
+
   it('resets the stall count when progress was made between pauses', async () => {
     const jobs = [job('a', { state: 'paused', reached_discord_message_id: '9' })]
     const updateImport = vi.fn(async () => job('a'))
