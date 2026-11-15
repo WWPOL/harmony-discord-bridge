@@ -168,6 +168,15 @@ describe('live relay of opted-out Discord users', () => {
     expect(h.createThread).toHaveBeenCalledTimes(1)
   })
 
+  it('names an opted-out starter by id alone when another member\'s message creates the thread', async () => {
+    const { rt, h } = setup()
+    const optedOutThread = { id: 't-du-1', name: 'their own words', type: 11, parentId: '1001', ownerId: 'du-1', guild: null }
+    rt.optOuts.add('du-1')
+    await rt.threads.harmonyThreadFor(optedOutThread, 'h1')
+    // Harmony titles the thread 'Thread' and leaves the notice unattributed only on this id.
+    expect(h.createThread).toHaveBeenCalledWith('h1', 'their own words', expect.objectContaining({ discordUser: { id: 'du-1' } }))
+  })
+
   it('takes a message another bot already stored as final, without an error', async () => {
     const { rt, h, error } = setup()
     h.sendMessage.mockRejectedValue(new HarmonyHttpError('Discord message id already stored', 409, 'DISCORD_MESSAGE_ID_TAKEN'))

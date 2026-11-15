@@ -120,14 +120,16 @@ describe('discordImportAccess.fetchMembers', () => {
 })
 
 describe('discordImportAccess.everyoneCanView', () => {
-  it('answers the effective View Channel permission of @everyone', async () => {
+  it('answers the effective View Channel and Read Message History permissions of @everyone', async () => {
     const { channel, guild, access } = setup()
     const everyone = { id: 'g1' }
     ;(guild as any).roles = { everyone }
-    let visible = true
-    channel.permissionsFor = vi.fn((who: unknown) => ({ has: (f: bigint) => who === everyone && f === PermissionFlagsBits.ViewChannel && visible }))
+    let granted = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory]
+    channel.permissionsFor = vi.fn((who: unknown) => ({ has: (f: bigint) => who === everyone && granted.includes(f) }))
     expect(await access.everyoneCanView('c1')).toBe(true)
-    visible = false
+    granted = [PermissionFlagsBits.ViewChannel]
+    expect(await access.everyoneCanView('c1')).toBe(false)
+    granted = [PermissionFlagsBits.ReadMessageHistory]
     expect(await access.everyoneCanView('c1')).toBe(false)
   })
 

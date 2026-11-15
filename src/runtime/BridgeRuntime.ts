@@ -863,15 +863,19 @@ export class BridgeRuntime {
   private capabilityLoad: Promise<void> | null = null
 
   /**
-   * Registers a guild's commands, again when the feature set changed since. While the gateway's
-   * capabilities are unknown the base set is registered at once; the read, or READY, adds the rest.
+   * Registers a guild's commands, again when the feature set changed since. A v2 bridge
+   * registers nothing while the gateway's capabilities are unknown: Discord's bulk overwrite
+   * with the base set deletes the capability commands, and adding them back gives them new ids,
+   * which drops the per-command permissions a server set on them. Discord keeps the previous
+   * registration until the capability read, or READY, registers.
    */
   private async registerCommandsFor(client: DiscordClient, guildId: string) {
-    if (this.mode === 'v2' && !this.harmony.capabilitiesKnown() && !this.capabilityLoad) {
-      this.capabilityLoad = this.harmony.loadCapabilities()
+    if (this.mode === 'v2' && !this.harmony.capabilitiesKnown()) {
+      this.capabilityLoad ??= this.harmony.loadCapabilities()
         .then(() => this.refreshCommands())
-        .catch(err => this.log.debug(`Gateway capabilities not read: ${errorText(err)}`))
+        .catch(err => this.log.info(`Slash commands are registered once Harmony answers: ${errorText(err)}`))
         .finally(() => { this.capabilityLoad = null })
+      return
     }
     const features = this.commandFeatures()
     const key = JSON.stringify(features)
@@ -1967,7 +1971,7 @@ export class BridgeRuntime {
 
   /**
    * The discord_user of the member who started a Discord thread (history import). Null for the
-   * bridge's own threads, a starter who left the guild, and one who opted out.
+   * bridge's own threads and a starter who left the guild; `{ id }` alone for one who opted out.
    */
   threadStarterForImport(thread: { id: string; ownerId: string | null }): Promise<Record<string, unknown> | null> {
     return this.discordThreadStarter(thread)
@@ -1975,11 +1979,14 @@ export class BridgeRuntime {
 
   /**
    * The discord_user of the member who started a Discord thread. Null for the bridge's own
-   * threads, a starter who is not a guild member, and one who opted out.
+   * threads and a starter who is not a guild member. An opted-out starter is `{ id }` alone:
+   * bot_create_thread and bridge_import_thread title the thread 'Thread' and leave the notice
+   * unattributed only when they receive that id.
    */
   private async discordThreadStarter(thread: { id: string; ownerId: string | null }): Promise<Record<string, unknown> | null> {
     const ownerId = thread.ownerId
-    if (!ownerId || ownerId === this.discord?.user?.id || this.optOuts.has(ownerId)) return null
+    if (!ownerId || ownerId === this.discord?.user?.id) return null
+    if (this.optOuts.has(ownerId)) return { id: ownerId }
     const guild = (thread as Partial<AnyThreadChannel>).guild
     const member = guild ? await guild.members.fetch(ownerId).catch(() => null) : null
     if (!member?.user) return null

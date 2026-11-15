@@ -18,6 +18,20 @@ Currently using polling for message edits/deletes because Supabase Realtime subs
 - Mappings live in memory (LRU, 50k); Discord ids are also stored in Harmony message metadata and restored from the last 100 messages per paired channel at startup
 - [ ] Edits/reactions on messages older than that window are not bridged after a restart
 
+### From the 2.6.0 review
+- [ ] A sticker Harmony refuses (422 `STICKER_FILE`) keeps its planned slot at every sync, so stickers past the server's limit are never copied (`expressionSync.ts`, `commands.ts` sticker apply)
+- [ ] Sync creates before it renames: a new item taking a renamed item's old name fails (23505), and name swaps never finish (`commands.ts` emoji and sticker apply order)
+- [ ] Two Discord items of one name: the copy kept from a removed one holds the name and the other is skipped at every sync
+- [ ] The sound report lists an applied rename as a clash; any Harmony sound of the same name blocks the copy
+- [ ] A batch POST that times out (120 s) is retried while the gateway still mirrors its files, so two copies download at once (`historyImport.ts` harmonyCall); dedupe keeps one row
+- [ ] An import disarmed by a 403 arms again only when the configuration changes
+- [ ] `/bridge-privacy opt-in` ends a pending erase the user asked for without saying so
+- [ ] `/bridge-privacy erase` answers 429 `erase_recent` with a one-second wait in its message
+- [ ] A reaction refused with 403 `BRIDGE_AUTHOR_OPTED_OUT` logs an error per reaction and does not add the author to the opt-out list
+- [ ] The import status shows the raw codes `server_purged`, `instance_purged` and `invalid_batch` (`importErrorText`)
+- [ ] `publish.yml` grants `packages: write` at workflow level, so the test job that runs `npm ci` holds it; `ci.yml` has no `permissions` block
+- [ ] Two Harmony servers bridging one guild: an opt-out reaches only the bridge where the member ran it
+
 ---
 
 ## Medium Priority

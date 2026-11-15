@@ -32,6 +32,7 @@ import { desiredSticker, harmonyStickerSyncItem, isStickerSkip, stickerDiffers, 
 import { desiredSound, harmonySyncItem, soundDiffers, soundUpdate, type DesiredSound } from './soundSync.js'
 import { BridgeApiError, type ImportJob, type OptOutState } from '../v2/BridgeApi.js'
 import { importPercent } from './importProgress.js'
+import { canReadHistory } from './importDiscord.js'
 
 // =============================================================================
 // Command definitions
@@ -473,7 +474,7 @@ async function handlePrivacyCommand(rt: BridgeRuntime, command: ChatInputCommand
         rt.log.info(`/bridge-privacy opt-in by ${userId} in guild ${guild.id}: ${s.opted_out ? `still out (${s.source ?? 'unknown'})` : 'in'}`)
         await say(s.opted_out
           ? `❌ ${standingText(s)}`
-          : '✅ You are opted in: your messages in this server go to Harmony again. Messages you sent while opted out are not copied.')
+          : '✅ You are opted in: your messages in this server go to Harmony again, from now on. Earlier ones, erased or sent while opted out, are not copied.')
         break
       }
       case 'status':
@@ -1094,7 +1095,7 @@ function importErrorText(code: string): string {
     case 'pair_not_importable': return "the pair no longer brings Discord messages to Harmony"
     case 'channel_encrypted': return 'channel is now encrypted'
     case 'import_disabled': return 'history import was turned off'
-    case 'discord_approval_required': return 'the Discord channel is hidden from @everyone: run `/bridge import-history` in it on Discord'
+    case 'discord_approval_required': return 'the Discord channel or its history is hidden from @everyone: run `/bridge import-history` in it on Discord'
     case 'discord_channel_unsupported': return 'this kind of Discord channel cannot be imported'
     case 'discord_access_lost': return 'the bot lost access to the Discord channel'
     case 'bridge_stalled': return 'the import stopped making progress'
@@ -1110,9 +1111,8 @@ function importDisabledText(err: BridgeApiError): string {
     : '❌ History import is turned off on this Harmony instance. An instance admin can turn it on.'
 }
 
-function memberCanView(channel: unknown, member: unknown): boolean {
-  const permissions = (channel as { permissionsFor?: (m: unknown) => { has(flag: bigint): boolean } | null } | null)?.permissionsFor?.(member)
-  return permissions?.has(PermissionFlagsBits.ViewChannel) === true
+function memberCanReadHistory(channel: unknown, member: unknown): boolean {
+  return canReadHistory((channel as { permissionsFor?: (m: unknown) => { has(flag: bigint): boolean } | null } | null)?.permissionsFor?.(member))
 }
 
 /**
@@ -1172,19 +1172,19 @@ async function startImportHistory(
     return
   }
 
-  // Only channels the invoker can view: starting an import is their approval to copy the channel.
+  // Only channels whose history the invoker can read: starting an import is their approval to copy it.
   const viewable: string[] = []
   const hidden: string[] = []
   for (const id of candidates) {
     const channel = guild.channels.cache.get(id) ?? await guild.channels.fetch(id).catch(() => null)
-    if (memberCanView(channel, command.member)) viewable.push(id)
+    if (memberCanReadHistory(channel, command.member)) viewable.push(id)
     else hidden.push(id)
   }
   const hiddenLine = hidden.length > 0
-    ? `Left out, you cannot view ${hidden.length === 1 ? 'it' : 'them'}: ${hidden.map(id => `<#${id}>`).join(', ')}`
+    ? `Left out, you cannot read ${hidden.length === 1 ? 'its' : 'their'} history: ${hidden.map(id => `<#${id}>`).join(', ')}`
     : null
   if (viewable.length === 0) {
-    await say(`❌ Nothing to import: you cannot view ${all ? 'any bridged channel' : 'this channel'}.${hiddenLine ? `\n${hiddenLine}` : ''}`)
+    await say(`❌ Nothing to import: you cannot read the history of ${all ? 'any bridged channel' : 'this channel'}.${hiddenLine ? `\n${hiddenLine}` : ''}`)
     return
   }
 

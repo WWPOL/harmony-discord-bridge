@@ -104,7 +104,7 @@ export interface ImportJob {
 }
 
 /** Why the gateway did not store a message of a batch. Final: the message is never resent as it was. */
-export type ImportRejectReason = 'invalid' | 'future_date' | 'opted_out' | 'automod' | 'too_long' | 'check_violation'
+export type ImportRejectReason = 'invalid' | 'future_date' | 'opted_out' | 'before_opt_in' | 'automod' | 'too_long' | 'check_violation'
 
 export interface ImportBatchResult {
   inserted: { discord_message_id: string; id: string }[]

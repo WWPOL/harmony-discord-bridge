@@ -37,6 +37,36 @@ describe('OptOutList change notice', () => {
   })
 })
 
+describe('OptOutList read from Harmony', () => {
+  it('keeps an opt-out and an opt-in made while a read is in flight over its older answer', async () => {
+    const list = new OptOutList()
+    list.add('in-later')
+    let answer!: (v: { version: string; ids: string[] }) => void
+    const loading = list.load(() => new Promise(resolve => { answer = resolve }))
+    list.add('out-now')
+    list.remove('in-later')
+    answer({ version: 'v5', ids: ['in-later', 'other'] })
+    await loading
+    expect(list.has('out-now')).toBe(true)
+    expect(list.has('in-later')).toBe(false)
+    expect(list.has('other')).toBe(true)
+    expect(list.version()).toBe('v5')
+
+    // Edits made before a read are the read's to settle.
+    list.add('stale')
+    await list.load(async () => ({ version: 'v6', ids: [] }))
+    expect(list.has('stale')).toBe(false)
+  })
+
+  it('leaves the list as it was when the read fails', async () => {
+    const list = new OptOutList()
+    list.replace('v1', ['1'])
+    await expect(list.load(async () => { throw new Error('down') })).rejects.toThrow('down')
+    expect(list.has('1')).toBe(true)
+    expect(list.version()).toBe('v1')
+  })
+})
+
 describe('opted-out members and the Harmony member list', () => {
   let dir: string
   beforeEach(() => {

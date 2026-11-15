@@ -526,6 +526,25 @@ describe('V2Bridge opt-out list', () => {
     await g.b.stop()
   })
 
+  it('tries again after a failed read when the configuration has not changed', async () => {
+    const g = privacyGateway('v1')
+    g.list.fail = true
+    await g.b.start()
+    await vi.advanceTimersByTimeAsync(10)
+    const reads = g.list.reads
+
+    g.list.fail = false
+    await g.b.refreshConfig('test')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(g.list.reads).toBe(reads + 1)
+    expect(g.runtimes[0].optOuts.has('111')).toBe(true)
+
+    await g.b.refreshConfig('test')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(g.list.reads).toBe(reads + 1)
+    await g.b.stop()
+  })
+
   it('asks nothing of a gateway without the privacy routes', async () => {
     const g = privacyGateway(null)
     await g.b.start()

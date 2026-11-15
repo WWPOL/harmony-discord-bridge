@@ -39,6 +39,8 @@ function setup(opts: {
   confirm?: 'confirm' | 'cancel' | 'timeout'
   /** Discord channel ids the invoker cannot view. */
   hidden?: string[]
+  /** Discord channel ids the invoker can view without Read Message History. */
+  noHistory?: string[]
 } = {}) {
   const api = {
     listImports: vi.fn(async () => [job()]),
@@ -76,9 +78,13 @@ function setup(opts: {
   }
   const member = { permissions: { has: (p: bigint) => opts.admin !== false && p === PermissionFlagsBits.Administrator } }
   const hidden = new Set(opts.hidden ?? [])
+  const noHistory = new Set(opts.noHistory ?? [])
   const channelOf = (id: string) => ({
     id,
-    permissionsFor: (who: unknown) => ({ has: (flag: bigint) => who === member && flag === PermissionFlagsBits.ViewChannel && !hidden.has(id) }),
+    permissionsFor: (who: unknown) => ({
+      has: (flag: bigint) => who === member && !hidden.has(id)
+        && (flag === PermissionFlagsBits.ViewChannel || (flag === PermissionFlagsBits.ReadMessageHistory && !noHistory.has(id))),
+    }),
   })
   const reply = vi.fn(async (_arg: any) => {})
   const message = {
@@ -182,9 +188,16 @@ describe('/bridge import-history', () => {
     const t = setup({ scope: 'all', hidden: ['d2'] })
     await handleInteraction(t.rt, t.interaction)
     expect(prompt(t)).toContain('Import the history of 1 channel into Harmony? <#d1>')
-    expect(prompt(t)).toContain('Left out, you cannot view it: <#d2>')
+    expect(prompt(t)).toContain('Left out, you cannot read its history: <#d2>')
     expect(t.api.startImports).toHaveBeenCalledWith(['d1'], expect.anything())
-    expect(edited(t)).toContain('Left out, you cannot view it: <#d2>')
+    expect(edited(t)).toContain('Left out, you cannot read its history: <#d2>')
+  })
+
+  it('leaves out a channel the invoker can view but whose history they cannot read', async () => {
+    const t = setup({ scope: 'all', noHistory: ['d2'] })
+    await handleInteraction(t.rt, t.interaction)
+    expect(prompt(t)).toContain('Import the history of 1 channel into Harmony? <#d1>')
+    expect(t.api.startImports).toHaveBeenCalledWith(['d1'], expect.anything())
   })
 
   it('starts nothing for a channel the invoker cannot view', async () => {
@@ -192,7 +205,7 @@ describe('/bridge import-history', () => {
     await handleInteraction(t.rt, t.interaction)
     expect(t.message.awaitMessageComponent).not.toHaveBeenCalled()
     expect(t.api.startImports).not.toHaveBeenCalled()
-    expect(edited(t)).toContain('you cannot view this channel')
+    expect(edited(t)).toContain('you cannot read the history of this channel')
   })
 
   it('starts the rest when Harmony names a pair it will not import', async () => {

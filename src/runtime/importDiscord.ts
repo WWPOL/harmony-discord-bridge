@@ -37,6 +37,15 @@ function archivedMs(thread: { archiveTimestamp?: number | null; archivedAt?: Dat
 /** Fixed start of the pinned notice; the bot's notice in a channel is found by it. */
 export const IMPORT_NOTICE_MARKER = '**This channel is bridged to Harmony.**'
 export const IMPORT_NOTICE_TEXT = `${IMPORT_NOTICE_MARKER} Messages here also appear in a Harmony channel, and older messages are being copied there now. \`/bridge-privacy\` opts you out or erases your copied messages.`
+/**
+ * Whether permissions let their holder read a channel's past messages: View Channel and Read
+ * Message History. Without the second, Discord shows only what arrives while the member watches.
+ */
+export function canReadHistory(permissions: { has(flag: bigint): boolean } | null | undefined): boolean {
+  return permissions?.has(PermissionFlagsBits.ViewChannel) === true
+    && permissions.has(PermissionFlagsBits.ReadMessageHistory) === true
+}
+
 /** Wait for the gateway's answer to one membership request. */
 const MEMBER_FETCH_TIMEOUT_MS = 20_000
 
@@ -130,7 +139,7 @@ export function discordImportAccess(getClient: () => Client | null, guildId: () 
       const channel = await pairChannel(channelId)
       const everyone = channel.guild?.roles?.everyone
       if (!everyone) return false
-      return channel.permissionsFor(everyone)?.has(PermissionFlagsBits.ViewChannel) === true
+      return canReadHistory(channel.permissionsFor(everyone))
     },
 
     async ensureNotice(channelId) {

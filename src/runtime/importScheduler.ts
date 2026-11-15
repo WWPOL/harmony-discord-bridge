@@ -73,6 +73,13 @@ const PRIORITY: Partial<Record<ImportJob['state'], number>> = { running: 0, paus
 
 /** Consecutive pauses without any progress after which a job is failed as stalled. */
 const STALL_LIMIT = 3
+/**
+ * Wait before a paused job is picked again, by its count of pauses in a row without progress
+ * (1-based). A run pauses after its own retries span about 30 s; these waits let the three
+ * strikes span about 13 minutes, so a Discord or Harmony outage of a few minutes does not fail
+ * the job. A job that runs without pausing is never held back.
+ */
+export const STALL_BACKOFF_MS = [2 * 60_000, 10 * 60_000]
 /** A job Harmony asked to wait for, with no Retry-After. */
 const WAIT_DEFAULT_MS = 60_000
 
@@ -276,6 +283,7 @@ export class ImportScheduler {
     const prev = this.stalls.get(id)
     const count = prev && prev.fingerprint === fp ? prev.count + 1 : 1
     this.stalls.set(id, { fingerprint: fp, count })
+    if (count < STALL_LIMIT) this.notBefore.set(id, this.now() + STALL_BACKOFF_MS[count - 1])
     if (count >= STALL_LIMIT) {
       log?.warn(`History import ${id}: no progress after ${count} pauses, failing it`)
       try {

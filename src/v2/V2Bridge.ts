@@ -255,9 +255,11 @@ export class V2Bridge {
     const version = this.directory?.config().privacy_version ?? null
     if (!list || version === null) return
     // One attempt: the importer retries at job level, the orchestrator at its next configuration read.
-    const { version: listVersion, remoteUserIds } = await this.api.getOptOuts(signal ? { signal } : {})
-    list.replace(listVersion ?? version, remoteUserIds)
-    this.log.debug(`Opt-out list read: ${remoteUserIds.length} user(s)`)
+    await list.load(async () => {
+      const { version: listVersion, remoteUserIds } = await this.api.getOptOuts(signal ? { signal } : {})
+      return { version: listVersion ?? version, ids: remoteUserIds }
+    })
+    this.log.debug(`Opt-out list read: ${list.size()} user(s)`)
   }
 
   /** Reads the opt-out list when the configuration's `privacy_version` is not the list's. */
@@ -409,6 +411,8 @@ export class V2Bridge {
 
     const json = JSON.stringify(config)
     if (json === this.configJson) {
+      // A failed read of the opt-out list leaves its version behind the configuration's.
+      void this.refreshOptOuts()
       if (hadError) this.statusSoon()
       return
     }

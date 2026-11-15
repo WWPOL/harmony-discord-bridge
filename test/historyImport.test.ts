@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Collection, MessageType } from 'discord.js'
-import { HistoryImporter, PAGE_DELAY_CAP_MS, RECENCY_MARGIN_MS, importUnsupported, isImportableMessage, snowflakeAt } from '../src/runtime/historyImport.js'
+import { HistoryImporter, KEEPALIVE_MS, PAGE_DELAY_CAP_MS, RECENCY_MARGIN_MS, importUnsupported, isImportableMessage, snowflakeAt } from '../src/runtime/historyImport.js'
 import { BridgeApiError, type ImportJob, type ImportMessage } from '../src/v2/BridgeApi.js'
 import { BridgeRuntime } from '../src/runtime/BridgeRuntime.js'
 import { V2Directory } from '../src/v2/V2Directory.js'
@@ -72,6 +72,8 @@ function setup(opts: {
   /** Private threads each listing page reports as filtered out. */
   skippedPrivate?: number[]
   listThreads?: (channel: string, cursor: Record<string, unknown> | null) => Promise<any>
+  /** The importer's clock; NOW by default. */
+  now?: () => number
 } = {}) {
   const all = opts.all ?? []
   const patches: Array<Record<string, unknown>> = []
@@ -134,7 +136,7 @@ function setup(opts: {
     onStickerRefused,
     reportProblem,
     pageDelayMs: opts.pageDelayMs ?? 7,
-    now: () => NOW,
+    now: opts.now ?? (() => NOW),
     sleep: async (ms: number) => { sleeps.push(ms) },
     log,
   })
@@ -484,6 +486,17 @@ describe('HistoryImporter Discord-side approval and notice', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not post or pin the notice'))
   })
 
+  it('does not post the notice again when a job resumes after its first page', async () => {
+    // The pin search cannot find a notice the bot could not pin.
+    const { importer, ensureNotice, posts, j } = setup({
+      all: history(3),
+      jobOver: { state: 'running', start_discord_message_id: SNOW(30), start_at: 'x', channel_created_at: 'y' },
+    })
+    expect(await run(importer, j)).toBe('done')
+    expect(posts.flat().length).toBeGreaterThan(0)
+    expect(ensureNotice).not.toHaveBeenCalled()
+  })
+
   it('does not post the notice again when a job resumes past the messages phase', async () => {
     const { importer, ensureNotice, j } = setup({ all: history(3), jobOver: { phase: 'replies', state: 'running' } })
     await run(importer, j)
@@ -756,6 +769,24 @@ describe('HistoryImporter threads and replies phases', () => {
     expect(threadPosts[1].every(m => m.thread_id === `ht-${T2}`)).toBe(true)
     expect(posts[0].every(m => !m.thread_id)).toBe(true)
     expect(patches.filter(p => 'threads_done' in p).map(p => p.threads_done)).toEqual([1, 2])
+  })
+
+  it('PATCHes at least every few minutes while it walks a long thread Harmony already holds', async () => {
+    // A job quiet for 10 minutes is paused when another job starts; the walk sends no PATCH of its own.
+    let clock = NOW
+    const { importer, patches, fetchPage, j } = setup({
+      all: [], threadPages: [[thread(T1)]], threadMessages: { [T1]: threadMsgs(10_000, 1000) },
+      now: () => clock,
+    })
+    const real = fetchPage.getMockImplementation()!
+    fetchPage.mockImplementation((c: string, b: string | undefined) => { clock += 60_000; return real(c, b) })
+    const at: number[] = []
+    const realUpdate = (importer as any).deps.api.updateImport.getMockImplementation()!
+    ;(importer as any).deps.api.updateImport.mockImplementation((id: string, patch: any, o?: unknown) => { at.push(clock); return realUpdate(id, patch, o) })
+    expect(await run(importer, j)).toBe('done')
+    expect(patches.filter(p => Object.keys(p).join() === 'authors_skipped').length).toBeGreaterThanOrEqual(2)
+    const gaps = at.slice(1).map((t, i) => t - at[i])
+    expect(Math.max(...gaps)).toBeLessThanOrEqual(KEEPALIVE_MS + 60_000)
   })
 
   it('skips a thread whose own fetch says unknown channel and still finishes the job', async () => {
@@ -1148,14 +1179,14 @@ describe('BridgeRuntime.translateForImport', () => {
     await runtime.stop()
   })
 
-  it('leaves the starter of a thread out when they left the guild or opted out', async () => {
+  it('leaves out the starter of a thread who left the guild; names one who opted out by id alone', async () => {
     const { runtime, rt } = await runtimeSetup()
     const present = fakeMember('g1', 'owner-1')
     const guild = { id: 'g1', members: { fetch: vi.fn(async (id: string) => { if (id === 'owner-1') return present; throw discordError(10007) }) } }
     expect(await rt.threadStarterForImport({ id: 't1', ownerId: 'owner-1', guild })).toMatchObject({ id: 'owner-1' })
     expect(await rt.threadStarterForImport({ id: 't2', ownerId: 'gone-1', guild })).toBeNull()
     rt.optOuts.add('owner-1')
-    expect(await rt.threadStarterForImport({ id: 't3', ownerId: 'owner-1', guild })).toBeNull()
+    expect(await rt.threadStarterForImport({ id: 't3', ownerId: 'owner-1', guild })).toEqual({ id: 'owner-1' })
     await runtime.stop()
   })
 })

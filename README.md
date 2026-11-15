@@ -51,24 +51,26 @@ you through the one you pick.
    replace `YOUR_APPLICATION_ID` (from **General Information**) in:
 
    ```
-   https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=309774642240&scope=bot%20applications.commands
+   https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=2252109588327488&scope=bot%20applications.commands
    ```
 
    This grants View Channels, Send Messages, Embed Links, Attach Files, Read
    Message History, Add Reactions, Manage Messages, Manage Webhooks, Create
-   Public Threads and Send Messages in Threads. Manage Messages lets a message
-   deleted on Harmony (by a moderator or by Harmony's AutoMod) disappear from
-   Discord too; the two thread permissions carry threads across (bridge 2.4).
-   For `/bridge clone-server`, use `permissions=309774642256` (adds Manage
+   Public Threads, Send Messages in Threads and Pin Messages. Manage Messages
+   lets a message deleted on Harmony (by a moderator or by Harmony's AutoMod)
+   disappear from Discord too; the two thread permissions carry threads across
+   (bridge 2.4); Pin Messages pins the history import notice (bridge 2.6).
+   For `/bridge clone-server`, use `permissions=2252109588327504` (adds Manage
    Channels).
 
    | Bot | Permission integer |
    |---|---|
-   | Your own bot (run yourself, or hosted by your instance) | `309774642240` (`309774642256` with Manage Channels for `/bridge clone-server`) |
+   | Your own bot (run yourself, or hosted by your instance) | `2252109588327488` (`2252109588327504` with Manage Channels for `/bridge clone-server`) |
    | The instance's bot (**Add to Discord**) | `309774904384` (adds Use External Emojis) |
 
-   A bot added before bridge 2.4 lacks the thread permissions until it is added
-   again with the link above (or **Add to Discord**).
+   A bot added before bridge 2.4 lacks the thread permissions, and one added
+   before 2.6 lacks Pin Messages, until it is added again with the link above
+   (or **Add to Discord**).
 
 ### 2. Get a setup code from Harmony
 
@@ -320,19 +322,23 @@ Messages written before a channel was bridged can be copied into Harmony.
 
 - In Discord: `/bridge import-history` in the channel, or `scope:all`. The
   command lists the channels and asks Confirm/Cancel before anything starts.
-  It covers only channels you can view yourself; with `scope:all` the others
-  are left out and named. Your Discord account is recorded as the one who
+  It covers only channels whose history you can read yourself (View Channel
+  and Read Message History); with `scope:all` the others are left out and
+  named. Your Discord account is recorded as the one who
   started it. `action:status` shows the state, percent and number of messages;
   `action:cancel` stops it.
 - In Harmony: Server settings → Discord Bridge, for one channel or all paired
-  channels. A channel that @everyone cannot view on Discord is not imported
-  this way: the job fails with `discord_approval_required`, and someone who
-  can view the channel starts it with the Discord command instead.
+  channels. A channel whose history @everyone cannot read on Discord (no View
+  Channel or no Read Message History) is not imported this way: the job fails
+  with `discord_approval_required`, and someone who can read it starts it with
+  the Discord command instead.
 
 When an import starts, the bot posts and pins one notice in the Discord
 channel: the channel is bridged to Harmony, older messages are being copied,
-and `/bridge-privacy` opts out or erases. A channel keeps one such notice. The
-import runs all the same when the bot cannot post or pin (the log says so).
+and `/bridge-privacy` opts out or erases. Each job posts it once; a job that
+finds the bot's notice among the pins posts none, so with Pin Messages a channel
+keeps one notice. The import runs all the same when the bot cannot post or pin
+(the log says so).
 
 There is no undo button. What is imported stays on Harmony until it is deleted
 there, or until its author erases their own messages with `/bridge-privacy erase`.
@@ -418,8 +424,9 @@ Other messages:
   - `erase`: deletes their bridged and imported messages on Harmony for this
     server and opts them out. It asks first and cannot be undone. Their
     Discord messages are not touched.
-  - `opt-in`: lets their messages through again. Messages sent while opted out
-    are not copied afterwards.
+  - `opt-in`: lets their messages through again, from then on. Earlier ones,
+    erased or sent while opted out, are not copied afterwards, by history
+    import either (Harmony 1.9.7).
   - `status`: shows where they stand.
 
   A Harmony server manager can also remove a Discord member from the bridge

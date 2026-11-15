@@ -88,15 +88,27 @@ describe('slash command registration by gateway capability', () => {
     await runtime.stop()
   })
 
-  it('registers the base set at once while Harmony cannot be asked, and again when READY brings capabilities', async () => {
+  it('registers nothing while Harmony cannot be asked, and the full set once READY brings capabilities', async () => {
+    // A registration without the capability commands deletes them on Discord; their next
+    // registration gets new ids and loses the permissions a server set on them.
     const { runtime, registrations, harmonyReady } = await setup({ me: null })
+    expect(registrations()).toHaveLength(0)
+    await harmonyReady(['bridge_sticker_sync'])
     expect(registrations()).toHaveLength(1)
-    expect(registrations()[0]).not.toContain('sync-stickers')
+    expect(registrations()[0]).toContain('sync-stickers')
     await harmonyReady(['bridge_sticker_sync'])
-    expect(registrations()).toHaveLength(2)
-    expect(registrations()[1]).toContain('sync-stickers')
-    await harmonyReady(['bridge_sticker_sync'])
-    expect(registrations()).toHaveLength(2)
+    expect(registrations()).toHaveLength(1)
+    await runtime.stop()
+  })
+
+  it('registers /bridge-privacy in the first registration, never in a second one', async () => {
+    const privacyApi = {} as any
+    const { runtime, harmonyReady } = await setup({ me: { id: 'hb', capabilities: ['bridge_privacy'] }, hooks: { privacyApi } })
+    await harmonyReady(['bridge_privacy'])
+    const client = (runtime as any).discord
+    const names = client.rest.put.mock.calls.map(([, body]: any) => (body.body as any[]).map(c => c.name))
+    expect(names).toHaveLength(1)
+    expect(names[0]).toContain('bridge-privacy')
     await runtime.stop()
   })
 

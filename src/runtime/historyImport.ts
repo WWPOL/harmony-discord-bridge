@@ -51,7 +51,7 @@ export interface HistoryImporterDeps {
    * the answer is not a member: left, banned, or a deleted account.
    */
   fetchMembers(channelId: string, userIds: string[]): Promise<Map<string, GuildMember>>
-  /** Whether @everyone can view the channel. */
+  /** Whether @everyone can view the channel and read its history. */
   everyoneCanView(channelId: string): Promise<boolean>
   /** Makes sure the channel holds the bot's pinned notice about the bridge and the import. */
   ensureNotice(channelId: string): Promise<void>
@@ -109,6 +109,8 @@ interface Run {
   authorsSkippedSent: number
   /** Threads whose own history could not be read. */
   threadsSkipped: number
+  /** now() of the last PATCH that succeeded. */
+  lastPatchAt: number
 }
 
 const DISCORD_EPOCH_MS = 1420070400000n
@@ -130,6 +132,13 @@ const RATE_WAIT_DEFAULT_MS = 5_000
 const RATE_WAIT_CAP_MS = 10 * 60_000
 /** Timeout of the PATCH that parks a job while the bridge stops. */
 const PARK_TIMEOUT_MS = 5_000
+/**
+ * Longest stretch without a PATCH while a job runs. Every PATCH sets the job's updated_at, and a
+ * running job quiet for 10 minutes is paused when another job starts (discord_bridge_import_update,
+ * c_stale). A walk of an imported thread posts only messages Harmony already holds, which leave
+ * updated_at as it was.
+ */
+export const KEEPALIVE_MS = 3 * 60_000
 /** Longest `error` Harmony stores. */
 const ERROR_MAX = 200
 const NO_PINS: ReadonlySet<string> = new Set()
@@ -208,6 +217,7 @@ export class HistoryImporter {
       authorsSkipped: skipped,
       authorsSkippedSent: skipped,
       threadsSkipped: 0,
+      lastPatchAt: this.now(),
     }
     try {
       // Always: a no-op for a job left 'running' by a crash, a transition for queued/paused.
@@ -215,11 +225,11 @@ export class HistoryImporter {
       run.started = true
       if (state.cancel_requested) await this.cancel(run)
 
-      // A channel @everyone cannot view is imported only when someone on Discord asked for it.
+      // A channel whose history @everyone cannot read is imported only when someone on Discord asked for it.
       if (state.requested_via === 'harmony') {
         const open = await this.discordCall(run, () => this.deps.everyoneCanView(state.discord_channel_id))
         if (!open) {
-          this.deps.log.warn(`History import ${state.id}: Discord channel ${state.discord_channel_id} is hidden from @everyone; it needs /bridge import-history on Discord`)
+          this.deps.log.warn(`History import ${state.id}: Discord channel ${state.discord_channel_id} or its history is hidden from @everyone; it needs /bridge import-history on Discord`)
           await this.fail(run, 'discord_approval_required')
         }
       }
@@ -249,11 +259,15 @@ export class HistoryImporter {
 
   private async messagesPhase(run: Run): Promise<void> {
     const channelId = run.job.discord_channel_id
-    // The notice tells the channel's members; the import runs without it.
-    try {
-      await untilAborted(this.deps.ensureNotice(channelId), run.signal)
-    } catch (error) {
-      if (!run.signal.aborted) this.deps.log.warn(`History import ${run.job.id}: could not post or pin the notice in Discord channel ${channelId}: ${errorText(error)}`)
+    // The notice tells the channel's members; the import runs without it. A job whose start
+    // marker is set ran this step in an earlier run: an unpinned notice is invisible to the pin
+    // search, so asking again would post it again.
+    if (!run.job.start_discord_message_id) {
+      try {
+        await untilAborted(this.deps.ensureNotice(channelId), run.signal)
+      } catch (error) {
+        if (!run.signal.aborted) this.deps.log.warn(`History import ${run.job.id}: could not post or pin the notice in Discord channel ${channelId}: ${errorText(error)}`)
+      }
     }
     const pins = await this.discordCall(run, () => this.deps.fetchPins(channelId))
     await this.importPages(run, { discordId: channelId, harmonyThreadId: null, pins })
@@ -393,6 +407,7 @@ export class HistoryImporter {
 
       await this.pageWait(run)
       await this.checkServerState(run)
+      await this.keepAlive(run)
     }
   }
 
@@ -549,8 +564,17 @@ export class HistoryImporter {
     }
   }
 
-  private patch(run: Run, patch: Partial<ImportJob>): Promise<unknown> {
-    return this.harmonyCall(run, () => this.deps.api.updateImport(run.job.id, patch, { signal: run.signal }))
+  private async patch(run: Run, patch: Partial<ImportJob>): Promise<unknown> {
+    const result = await this.harmonyCall(run, () => this.deps.api.updateImport(run.job.id, patch, { signal: run.signal }))
+    run.lastPatchAt = this.now()
+    return result
+  }
+
+  /** A PATCH of the skip count when the job has had none for KEEPALIVE_MS; it changes no state. */
+  private async keepAlive(run: Run): Promise<void> {
+    if (this.now() - run.lastPatchAt < KEEPALIVE_MS) return
+    await this.patch(run, { authors_skipped: run.authorsSkipped })
+    run.authorsSkippedSent = run.authorsSkipped
   }
 
   /**
