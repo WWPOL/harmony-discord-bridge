@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Collection, Events, MessageFlags, PermissionFlagsBits, Routes } from 'discord.js'
+import { HarmonyHttpError } from '../src/HarmonyClient.js'
 import { BridgeRuntime } from '../src/runtime/BridgeRuntime.js'
 import { V2Directory } from '../src/v2/V2Directory.js'
 import { APPLICATION_FLAGS } from '../src/runtime/discordConnection.js'
@@ -537,6 +538,49 @@ describe('Harmony custom emoji on Discord', () => {
     }))
     expect(lastWebhookPayload(webhook).content).toBe(':gone:')
     expect(client.rest.post).not.toHaveBeenCalled()
+    await runtime.stop()
+  })
+})
+
+describe('Harmony reactions on messages the bridge did not relay in this run', () => {
+  const cdn = { id: 'e10', name: 'pog', url: 'https://cdn.discordapp.com/emojis/4242.gif', animated: true }
+
+  it('finds the Discord message in the Harmony message metadata', async () => {
+    const { rt, runtime, channel, h } = await setup()
+    h.getMessage.mockResolvedValue({ id: 'hm-imp', metadata: { discord_message_id: 'dm-imp', history_import: true } })
+    await rt.onHarmonyReactionAdd({ reaction_id: 'r1', message_id: 'hm-imp', channel_id: 'h1', emoji: cdn })
+    expect(channel.reactions).toEqual(['a:pog:4242'])
+    await rt.onHarmonyReactionAdd({ reaction_id: 'r2', message_id: 'hm-imp', channel_id: 'h1', emoji: cdn })
+    expect(h.getMessage).toHaveBeenCalledTimes(1)
+    await runtime.stop()
+  })
+
+  it('asks once about a Harmony message with no Discord id', async () => {
+    const { rt, runtime, channel, h } = await setup()
+    h.getMessage.mockResolvedValue({ id: 'hm-own', metadata: {} })
+    await rt.onHarmonyReactionAdd({ reaction_id: 'r1', message_id: 'hm-own', channel_id: 'h1', emoji: cdn })
+    await rt.onHarmonyReactionAdd({ reaction_id: 'r2', message_id: 'hm-own', channel_id: 'h1', emoji: cdn })
+    expect(channel.reactions).toEqual([])
+    expect(h.getMessage).toHaveBeenCalledTimes(1)
+    await runtime.stop()
+  })
+
+  it('asks again after a failed read instead of remembering it as a miss', async () => {
+    const { rt, runtime, channel, h } = await setup()
+    h.getMessage.mockRejectedValueOnce(new HarmonyHttpError('busy', 503))
+    await rt.onHarmonyReactionAdd({ reaction_id: 'r1', message_id: 'hm-imp', channel_id: 'h1', emoji: cdn })
+    expect(channel.reactions).toEqual([])
+    h.getMessage.mockResolvedValue({ id: 'hm-imp', metadata: { discord_message_id: 'dm-imp' } })
+    await rt.onHarmonyReactionAdd({ reaction_id: 'r2', message_id: 'hm-imp', channel_id: 'h1', emoji: cdn })
+    expect(channel.reactions).toEqual(['a:pog:4242'])
+    expect(h.getMessage).toHaveBeenCalledTimes(2)
+    await runtime.stop()
+  })
+
+  it('looks nothing up for the removal of a reaction it never mirrored', async () => {
+    const { rt, runtime, h } = await setup()
+    await rt.onHarmonyReactionRemove({ reaction_id: 'r-unknown', message_id: 'hm-imp', channel_id: 'h1' })
+    expect(h.getMessage).not.toHaveBeenCalled()
     await runtime.stop()
   })
 })

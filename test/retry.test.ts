@@ -87,6 +87,33 @@ describe('fetchWithRetry', () => {
   })
 })
 
+describe('fetchWithRetry abort signal', () => {
+  it('rejects a wait between attempts as soon as the signal aborts', async () => {
+    const stop = new AbortController()
+    const fetchImpl = vi.fn(async () => new Response('{}', { status: 429, headers: { 'Retry-After': '60' } }))
+    const pending = fetchWithRetry('https://x.test/', {}, { fetchImpl, signal: stop.signal })
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1))
+    stop.abort()
+    await expect(pending).rejects.toBeTruthy()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it('passes a signal that aborts with the caller to fetch, next to the timeout', async () => {
+    const stop = new AbortController()
+    let seen: AbortSignal | undefined
+    const fetchImpl = vi.fn((_url: string | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      seen = init?.signal ?? undefined
+      seen?.addEventListener('abort', () => reject(new Error('aborted')))
+    }))
+    const pending = fetchWithRetry('https://x.test/', {}, { fetchImpl, signal: stop.signal, timeoutMs: 60_000 })
+    await vi.waitFor(() => expect(seen).toBeDefined())
+    expect(seen!.aborted).toBe(false)
+    stop.abort()
+    await expect(pending).rejects.toThrow('aborted')
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('Backoff', () => {
   it('doubles up to the cap', () => {
     const b = new Backoff(1000, 8000, 0)
@@ -148,5 +175,23 @@ describe('HarmonyClient REST', () => {
     await expect(c.getServerChannels('s-1')).rejects.toThrow('Invalid token')
     expect(authFailed).toHaveBeenCalledOnce()
     expect(c.isAuthRejected()).toBe(true)
+  })
+})
+
+describe('HarmonyClient.getMessage', () => {
+  const client = (fetchImpl: FetchLike) => new HarmonyClient('tok', 'ws://unused', 'https://har.example/bot-gateway', {
+    log: silentLogger,
+    fetchImpl,
+    retry: { sleep: async () => {} },
+  })
+
+  it('answers null for a message that is gone or out of reach', async () => {
+    expect(await client(sequence(new Response('', { status: 404 }))).getMessage('m')).toBeNull()
+    expect(await client(sequence(new Response('', { status: 403 }))).getMessage('m')).toBeNull()
+  })
+
+  it('throws on a failure, so a caller does not take it for no message', async () => {
+    const failing = vi.fn(async () => new Response('down', { status: 503 }))
+    await expect(client(failing).getMessage('m')).rejects.toBeInstanceOf(HarmonyHttpError)
   })
 })

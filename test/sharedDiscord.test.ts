@@ -325,6 +325,8 @@ function runtimeFor(shared: SharedDiscordClient, bridge: string, guild: string |
   const fetchImpl = vi.fn(async (url: string | URL) => {
     const u = String(url)
     if (u.includes('/members')) return Response.json([])
+    // Commands are registered once the gateway's capabilities are read.
+    if (u.endsWith('/users/@me')) return Response.json({ id: `hb-${bridge}` })
     return new Response('not found', { status: 404 })
   })
   return new BridgeRuntime({

@@ -1,5 +1,5 @@
 import { ChannelType, type AnyThreadChannel, type TextChannel } from 'discord.js'
-import type { HarmonyClient } from '../HarmonyClient.js'
+import { HarmonyHttpError, type HarmonyClient } from '../HarmonyClient.js'
 import { BoundedMap } from '../utils/BoundedMap.js'
 import { errorText } from '../log.js'
 
@@ -20,7 +20,25 @@ export interface ThreadAnchor {
   remove(): Promise<unknown>
 }
 
-type DiscordThreadLike = Pick<AnyThreadChannel, 'id' | 'name' | 'ownerId'>
+type DiscordThreadLike = Pick<AnyThreadChannel, 'id' | 'name' | 'ownerId' | 'type'>
+
+/**
+ * Whether threads can exist in a Discord channel. Voice and stage channels have a text chat
+ * but no thread manager.
+ */
+export function supportsThreads(channel: { type?: number; threads?: unknown } | null | undefined): boolean {
+  if (!channel) return false
+  if (channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice) return false
+  return channel.threads !== undefined && channel.threads !== null
+}
+
+/**
+ * Whether a Discord channel is a private thread. Harmony has no private threads (every thread
+ * is visible to the whole channel), so these never cross the bridge in either direction.
+ */
+export function isPrivateThread(channel: { type?: number } | null | undefined): boolean {
+  return channel?.type === ChannelType.PrivateThread
+}
 
 export interface ThreadSyncDeps {
   harmony: Pick<HarmonyClient, 'createThread' | 'lookupThreadByDiscordId' | 'getThread' | 'pairThread'>
@@ -32,6 +50,8 @@ export interface ThreadSyncDeps {
   harmonyMessageFor(discordMessageId: string, harmonyChannelId: string): Promise<string | null>
   /** The Discord message a Harmony message was bridged to, or null. */
   discordMessageFor(harmonyMessageId: string, harmonyChannelId: string): Promise<string | null>
+  /** Drops a mapping whose Harmony message is gone. */
+  forgetHarmonyMessage?(harmonyMessageId: string): void
   log: { info(msg: string): void; warn(msg: string): void; debug(msg: string): void }
 }
 
@@ -74,6 +94,7 @@ export class ThreadSync {
 
   /** The Harmony thread for a Discord thread whose parent is paired with `harmonyChannelId`. */
   async harmonyThreadFor(thread: DiscordThreadLike, harmonyChannelId: string): Promise<string | null> {
+    if (isPrivateThread(thread)) return null
     const cached = this.toHarmony.get(thread.id)
     if (cached) return cached
     return this.once(`d:${thread.id}`, async () => {
@@ -82,13 +103,25 @@ export class ThreadSync {
         this.remember(thread.id, found.id)
         return found.id
       }
-      const starter = await this.deps.harmonyMessageFor(thread.id, harmonyChannelId)
+      let starter = await this.deps.harmonyMessageFor(thread.id, harmonyChannelId)
       const discordUser = await this.deps.threadStarter?.(thread).catch(() => null) ?? null
-      const created = await this.deps.harmony.createThread(harmonyChannelId, threadName(thread.name), {
-        messageId: starter,
+      const create = (messageId: string | null) => this.deps.harmony.createThread(harmonyChannelId, threadName(thread.name), {
+        messageId,
         discordThreadId: thread.id,
         ...(discordUser ? { discordUser } : {}),
       })
+      let created
+      try {
+        created = await create(starter)
+      } catch (error) {
+        // 404: the mapped starter is gone from the channel (erased, purged, or a re-paired
+        // channel's). The thread starts standalone.
+        if (!starter || !(error instanceof HarmonyHttpError) || error.status !== 404) throw error
+        this.deps.log.debug(`Harmony message ${starter} is gone; Discord thread ${thread.id} starts standalone`)
+        this.deps.forgetHarmonyMessage?.(starter)
+        starter = null
+        created = await create(null)
+      }
       this.remember(thread.id, created.id)
       this.deps.log.info(`Discord thread ${thread.id} → Harmony thread ${created.id}${starter ? ` on ${starter}` : ''}`)
       return created.id
@@ -109,6 +142,10 @@ export class ThreadSync {
     create = true,
     author: ThreadAuthor | null = null,
   ): Promise<AnyThreadChannel | null> {
+    if (!supportsThreads(parent)) {
+      this.deps.log.debug(`Harmony thread ${harmonyThreadId}: Discord channel ${parent?.id} has no threads; not bridged`)
+      return null
+    }
     const id = this.toDiscord.get(harmonyThreadId) ?? await this.once(`h:${harmonyThreadId}:${create}`, async () => {
       const info = await this.deps.harmony.getThread(harmonyThreadId)
       if (!info) return null
@@ -134,6 +171,10 @@ export class ThreadSync {
     const thread = await parent.threads.fetch(id).catch(() => null)
     if (!thread) {
       this.deps.log.warn(`Discord thread ${id} of Harmony thread ${harmonyThreadId} is gone`)
+      return null
+    }
+    if (isPrivateThread(thread)) {
+      this.deps.log.debug(`Discord thread ${id} of Harmony thread ${harmonyThreadId} is private; not bridged`)
       return null
     }
     if (thread.archived && !thread.locked) await thread.setArchived(false).catch(() => {})
