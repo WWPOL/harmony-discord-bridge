@@ -85,6 +85,7 @@ async function main() {
         dataDir: resolveDataDir(),
         log,
         version,
+        hostedIsolation: plan.hostedIsolation,
       })
     }
   } catch (err) {

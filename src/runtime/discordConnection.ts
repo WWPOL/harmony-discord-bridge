@@ -13,7 +13,7 @@ const DISCORD_API = 'https://discord.com/api/v10'
 
 /**
  * Application flags (Discord API, Application Object → Application Flags).
- * The *_LIMITED bits mean the toggle is on for an unverified app under 100 guilds.
+ * The *_LIMITED bits mean the toggle is on for an app below Discord's review threshold (10,000 users since 2026-06).
  */
 export const APPLICATION_FLAGS = {
   GATEWAY_PRESENCE: 1 << 12,

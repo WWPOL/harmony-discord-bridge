@@ -467,6 +467,8 @@ Other messages:
 | `src/v2/V2Bridge.ts` | One v2 bridge: config refresh (60 s + `BRIDGE_CONFIG_UPDATE`), status heartbeat (30 s). |
 | `src/v2/V2Directory.ts` | `/config` as a pair directory; settings defaults. |
 | `src/v2/HostRunner.ts` | Host mode reconciliation of `/hosted` (own-bot bridges). |
+| `src/v2/WorkerHostedInstance.ts` | One own-bot bridge in a worker thread: heap limit, crash and hang restarts with backoff. |
+| `src/v2/hostedWorker.ts` | Worker thread entry: one V2Bridge; protocol in `hostedWorkerProtocol.ts`. |
 | `src/v2/InstanceHost.ts` | Host mode reconciliation of `/hosted/instance` (instance bot bridges). |
 | `src/v2/selfCheck.ts` | Guild/channel permission snapshot, status payload. |
 | `src/problems.ts` | Problem codes, detection, plain-language text. |
@@ -537,12 +539,21 @@ settings). Set the same `BRIDGE_HOST_SECRET` on bot-gateway and here:
 | `BRIDGE_HOST_SECRET` | Shared secret for `GET /bridge/v2/hosted`. |
 | `HARMONY_PUBLIC_URL` | Public Harmony address, when `HARMONY_URL` points at bot-gateway directly. |
 | `HARMONY_MEDIA_ORIGIN` | Kong as the container reaches it, e.g. `http://supabase-kong:8000` on the Docker network or `http://127.0.0.1:8000`. Files and emoji whose address starts with the public Harmony address are downloaded from here instead (same path and signed query). Kong routes by path, so the different host name does not matter. |
+| `BRIDGE_HOSTED_ISOLATION` | `worker` (default): each own-bot bridge runs in its own thread. `inline`: all on the main thread. |
+| `BRIDGE_HOSTED_HEAP_MB` | Memory limit of each own-bot bridge thread, in MB. Default `256`, minimum `64`. |
 | `DATA_DIR`, `LOG_LEVEL`, `HEALTH_PORT`, `MAX_UPLOAD_MB` | As above. |
 
 The container can run on any machine that reaches `HARMONY_URL`. The lists
 are re-read every 60 s: new bridges start, removed ones stop, changed tokens
-restart. One bridge failing does not affect the others. `/health` is 200
-while the lists load and reports each bridge.
+restart. `/health` is 200 while the lists load and reports each bridge.
+
+Each own-bot bridge runs in its own thread with its own memory limit. A
+bridge that runs out of memory, crashes, or stops responding for 2 minutes
+ends alone and restarts after about 5 s, doubling to at most 5 minutes while it
+keeps failing; the others keep running. `/health` shows each bridge's
+`restarts` and `last_exit` (time and reason). A thread costs about 50 MB.
+Instance bot bridges share one Discord login and run together on the main
+thread, so the container's own memory limit is their safety net.
 
 #### Your instance's bot
 
@@ -583,9 +594,12 @@ leaves the old Discord server after 10 minutes. It never leaves while Harmony
 cannot be reached.
 
 Discord limits a bot that is not verified to 100 servers. Past that, apply
-for verification in the Developer Portal, and for the privileged intents
-(Message Content is needed; Server Members for member lists; Presence is
-rarely granted).
+for verification in the Developer Portal. The privileged intents (Message
+Content is needed; Server Members for member lists; Presence is rarely
+granted) are reviewed separately, once more than 10,000 people can see the
+app across its servers (Discord's rule since June 2026; one large server can
+cross it). The portal then gives the app or team owner 90 days to apply; the
+bot keeps working during the review.
 
 ### Behavior notes
 
