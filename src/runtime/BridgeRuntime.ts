@@ -1368,31 +1368,41 @@ export class BridgeRuntime {
   private sendRegistration() {
     const syncMembers = this.settings().syncMemberList
     const listed = !syncMembers ? [] : Array.from(this.discordMemberDetails.values()).filter(m => !this.optOuts.has(m.id))
-    const channels = this.dir.getBridges().flatMap(bridge => {
-      const members = listed
-        .filter(m => m.guildId === bridge.discordGuildId)
-        .map(m => ({
-          id: m.id,
-          username: m.username,
-          displayName: m.displayName,
-          avatarUrl: m.avatarUrl,
-          bannerUrl: m.bannerUrl,
-          accentColor: m.accentColor,
-          harmonyRoleIds: m.harmonyRoleIds,
-          roles: m.roles,
-          joinedAt: m.joinedAt,
-          createdAt: m.createdAt,
-          presenceStatus: m.presenceStatus,
-          customStatus: m.customStatus,
-          source: 'discord' as const,
-        }))
+    const bridges = this.dir.getBridges()
+    const lists = bridges.map(bridge => listed
+      .filter(m => m.guildId === bridge.discordGuildId)
+      .map(m => ({
+        id: m.id,
+        username: m.username,
+        displayName: m.displayName,
+        avatarUrl: m.avatarUrl,
+        bannerUrl: m.bannerUrl,
+        accentColor: m.accentColor,
+        harmonyRoleIds: m.harmonyRoleIds,
+        roles: m.roles,
+        joinedAt: m.joinedAt,
+        createdAt: m.createdAt,
+        presenceStatus: m.presenceStatus,
+        customStatus: m.customStatus,
+        source: 'discord' as const,
+      })))
 
-      return bridge.channelMappings.map(mapping => ({
-        harmonyChannelId: mapping.harmony,
-        discordChannelId: mapping.discord,
-        members,
-      }))
+    // op 6 root `members` backs every channel that omits its own list, provided those channels sit in
+    // one Harmony server (bot-gateway handleBridgeDataRegistration); one bridge is one server. The
+    // bridge with the largest pairs x members product goes at the root and is serialized once. A
+    // per-channel list is a full copy on the wire: 38 pairs x 17,328 members exceeded 1 GB of heap.
+    let root = -1
+    let rootCost = -1
+    bridges.forEach((bridge, i) => {
+      const cost = bridge.channelMappings.length * lists[i].length
+      if (bridge.channelMappings.length > 0 && cost > rootCost) {
+        root = i
+        rootCost = cost
+      }
     })
+    const channels = bridges.flatMap((bridge, i) => bridge.channelMappings.map(mapping => i === root
+      ? { harmonyChannelId: mapping.harmony, discordChannelId: mapping.discord }
+      : { harmonyChannelId: mapping.harmony, discordChannelId: mapping.discord, members: lists[i] }))
 
     const summary = `Registering bridge data: ${channels.length} channel(s), ${listed.length} Discord member(s)`
     if (summary !== this.lastRegistrationSummary) {
@@ -1405,9 +1415,9 @@ export class BridgeRuntime {
       this.log.debug(`  ${ch.harmonyChannelId} <-> Discord ${ch.discordChannelId}`)
     }
 
-    if (this.harmony.registerBridgeData(channels)) {
+    if (this.harmony.registerBridgeData(channels, root >= 0 ? lists[root] : [])) {
       // op 6 carries presence; deltas start from what it sent.
-      this.presenceDeltas.baseline(channels.flatMap(ch => ch.members))
+      this.presenceDeltas.baseline(lists.filter((_, i) => bridges[i].channelMappings.length > 0).flat())
     }
   }
 
