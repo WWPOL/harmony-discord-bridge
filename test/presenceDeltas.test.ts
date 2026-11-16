@@ -216,8 +216,8 @@ describe('BridgeRuntime presence sync', () => {
     expect(op6).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(100)
     expect(op6).toHaveBeenCalledTimes(1)
-    const [channels] = op6.mock.calls[0]
-    expect(channels[0].members?.find(m => m.id === 'u2')).toMatchObject({ presenceStatus: 'away', customStatus: null })
+    const [channels, root] = op6.mock.calls[0]
+    expect((channels[0].members ?? root)?.find(m => m.id === 'u2')).toMatchObject({ presenceStatus: 'away', customStatus: null })
     await runtime.stop()
   })
 

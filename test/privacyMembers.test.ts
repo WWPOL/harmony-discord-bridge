@@ -127,12 +127,26 @@ describe('opted-out members and the Harmony member list', () => {
     client.emit(Events.GuildMemberAdd, fakeMember('g1', 'u2'))
     // op 6 waits out its 5 s interval after the READY registration.
     await vi.advanceTimersByTimeAsync(5_000)
+    /** Each channel entry's list of an op 6 call; an entry without `members` inherits the root list, as bot-gateway resolves it. */
+    const resolve = (c: unknown[]) => (c[0] as Array<{ members?: Array<{ id: string }> }>).map(ch => ch.members ?? (c[1] as Array<{ id: string }> | undefined) ?? [])
     /** Member ids of each channel entry of the latest op 6. */
-    const listed = () => (op6.mock.calls.at(-1)![0] as Array<{ members?: Array<{ id: string }> }>).map(ch => (ch.members ?? []).map(m => m.id).sort())
+    const listed = () => resolve(op6.mock.calls.at(-1)!).map(list => list.map(m => m.id).sort())
     /** Every member id any op 6 so far carried. */
-    const everListed = () => new Set(op6.mock.calls.flatMap(c => (c[0] as Array<{ members?: Array<{ id: string }> }>).flatMap(ch => (ch.members ?? []).map(m => m.id))))
+    const everListed = () => new Set(op6.mock.calls.flatMap(c => resolve(c).flatMap(list => list.map(m => m.id))))
     return { runtime, rt: runtime as any, client, op6, op7, listed, everListed }
   }
+
+  it('serializes the member list once for all pairs: the root carries it, the pairs inherit', async () => {
+    const t = await setup()
+    t.client.emit(Events.GuildMemberAdd, fakeMember('g1', 'u3'))
+    await vi.advanceTimersByTimeAsync(5_000)
+    const call = t.op6.mock.calls.at(-1)! as any[]
+    expect(call[0].map((ch: Record<string, unknown>) => 'members' in ch)).toEqual([false, false])
+    expect(call[1].map((m: { id: string }) => m.id).sort()).toEqual(['u1', 'u2', 'u3'])
+    expect(t.listed()).toEqual([['u1', 'u2', 'u3'], ['u1', 'u2', 'u3']])
+    expect(JSON.stringify(call).match(/"id":"u3"/g)).toHaveLength(1)
+    await t.runtime.stop()
+  })
 
   it('registers every member but the opted-out ones, in every channel entry', async () => {
     const t = await setup({ optedOutFirst: ['u1'] })
@@ -245,7 +259,8 @@ describe('opted-out members and the Harmony member list', () => {
     expect(t.op7).not.toHaveBeenCalled()
     t.runtime.optOuts.remove('u1')
     await vi.advanceTimersByTimeAsync(5_000)
-    const members = (t.op6.mock.calls.at(-1)![0] as any[])[0].members as Array<{ id: string; presenceStatus: string }>
+    const call = t.op6.mock.calls.at(-1)! as any[]
+    const members = (call[0][0].members ?? call[1]) as Array<{ id: string; presenceStatus: string }>
     expect(members.find(m => m.id === 'u1')).toMatchObject({ presenceStatus: 'online' })
     await t.runtime.stop()
   })
