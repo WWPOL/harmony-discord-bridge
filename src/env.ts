@@ -3,6 +3,17 @@ import { normalizeHarmonyUrl } from './v2/endpoints.js'
 export const README_URL = 'https://github.com/y4my4my4m/harmony-discord-bridge#readme'
 export const DEFAULT_HEALTH_PORT = 8080
 
+/** How host mode runs own-bot hosted bridges. */
+export interface HostedIsolation {
+  /** worker: one thread per bridge under a heap limit; inline: all on the main thread. */
+  mode: 'worker' | 'inline'
+  /** Old-generation heap limit per worker, MB. */
+  heapMb: number
+}
+
+export const DEFAULT_HOSTED_ISOLATION: HostedIsolation = { mode: 'worker', heapMb: 256 }
+const MIN_HOSTED_HEAP_MB = 64
+
 export type LaunchPlan =
   | { kind: 'v1'; configPath: string; healthPort: number | null }
   | {
@@ -20,6 +31,7 @@ export type LaunchPlan =
       hostSecret: string
       publicUrl: string | null
       healthPort: number | null
+      hostedIsolation: HostedIsolation
     }
   | { kind: 'error'; message: string }
 
@@ -89,7 +101,9 @@ export function planLaunch(env: NodeJS.ProcessEnv, legacyConfigPath: string | nu
     }
     const healthPort = parseHealthPort(rawPort, DEFAULT_HEALTH_PORT)
     if (healthPort === 'invalid') return { kind: 'error', message: `HEALTH_PORT="${rawPort}" is not a port number.` }
-    return { kind: 'host', harmonyUrl, hostSecret: hostSecret!, publicUrl, healthPort }
+    const hostedIsolation = parseHostedIsolation(env)
+    if (typeof hostedIsolation === 'string') return { kind: 'error', message: hostedIsolation }
+    return { kind: 'host', harmonyUrl, hostSecret: hostSecret!, publicUrl, healthPort, hostedIsolation }
   }
 
   if (rawUrl && mode !== 'v1') {
@@ -125,6 +139,25 @@ export function planLaunch(env: NodeJS.ProcessEnv, legacyConfigPath: string | nu
   }
 
   return { kind: 'error', message: NOT_CONFIGURED }
+}
+
+/**
+ * BRIDGE_HOSTED_ISOLATION (worker | inline, default worker) and BRIDGE_HOSTED_HEAP_MB
+ * (default 256, min 64). Host mode only. An error message on invalid input.
+ */
+export function parseHostedIsolation(env: NodeJS.ProcessEnv): HostedIsolation | string {
+  const rawMode = value(env, 'BRIDGE_HOSTED_ISOLATION')
+  const mode = (rawMode ?? DEFAULT_HOSTED_ISOLATION.mode).toLowerCase()
+  if (mode !== 'worker' && mode !== 'inline') {
+    return `BRIDGE_HOSTED_ISOLATION="${rawMode}" is not recognised. Use worker or inline.`
+  }
+  const rawHeap = value(env, 'BRIDGE_HOSTED_HEAP_MB')
+  if (rawHeap === null) return { mode, heapMb: DEFAULT_HOSTED_ISOLATION.heapMb }
+  const heapMb = Number(rawHeap)
+  if (!/^\d+$/.test(rawHeap) || heapMb < MIN_HOSTED_HEAP_MB) {
+    return `BRIDGE_HOSTED_HEAP_MB="${rawHeap}" must be a whole number of MB, at least ${MIN_HOSTED_HEAP_MB}.`
+  }
+  return { mode, heapMb }
 }
 
 /** History import tuning (BRIDGE_IMPORT_*). Self-run mode only. */

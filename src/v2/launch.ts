@@ -1,12 +1,15 @@
 import { mkdirSync } from 'fs'
 import { join } from 'path'
-import { BridgeApi } from './BridgeApi.js'
+import { BridgeApi, type HostedEntry } from './BridgeApi.js'
 import { CredentialsError, obtainCredentials, type StoredCredentials } from './credentials.js'
 import { EndpointError, endpointsFor, probeEndpoints, type HarmonyEndpoints } from './endpoints.js'
-import { HostRunner } from './HostRunner.js'
+import { HostRunner, type HostedInstance } from './HostRunner.js'
 import { InstanceHost } from './InstanceHost.js'
 import { V2Bridge, type V2ImportOptions } from './V2Bridge.js'
-import { DEFAULT_IMPORT_SETTINGS, type ImportSettings } from '../env.js'
+import { WorkerHostedInstance } from './WorkerHostedInstance.js'
+import { HOSTED_AUTH_HINT, HOSTED_DISCORD_TOKEN_HINT, SELF_AUTH_HINT } from './hints.js'
+import type { HostedWorkerData } from './hostedWorkerProtocol.js'
+import { DEFAULT_HOSTED_ISOLATION, DEFAULT_IMPORT_SETTINGS, type HostedIsolation, type ImportSettings } from '../env.js'
 import { ImportSlots } from '../runtime/importScheduler.js'
 import { SharedDiscordClient } from '../runtime/SharedDiscordClient.js'
 import { Backoff, sleep, type FetchLike } from '../http.js'
@@ -21,14 +24,7 @@ export class FatalConfigError extends Error {
   }
 }
 
-export const SELF_AUTH_HINT =
-  'Harmony rejected this bridge\'s credentials (the bridge was deleted or a newer setup code was redeemed). In Harmony open Server Settings → Discord Bridge, generate a new setup code and set it as HARMONY_SETUP_CODE.'
-
-export const HOSTED_DISCORD_TOKEN_HINT =
-  'Discord rejected the bot token stored in Harmony. Reset it in the Discord Developer Portal (Bot → Reset Token) and paste it again in Harmony → Server Settings → Discord Bridge.'
-
-export const HOSTED_AUTH_HINT =
-  'Harmony rejected this hosted bridge\'s token; the host runner restarts it when Harmony issues a new one.'
+export { HOSTED_AUTH_HINT, HOSTED_DISCORD_TOKEN_HINT, SELF_AUTH_HINT }
 
 /** Retries `fn` with backoff while `isTransient` accepts its error; other errors propagate. */
 async function untilReachable<T>(
@@ -165,9 +161,14 @@ export async function runSelf(opts: {
 
 const safeDirName = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, '_')
 
+/** Period of a hosted worker's health messages, ms. */
+const HOSTED_HEALTH_INTERVAL_MS = 5_000
+
 /**
  * Host mode: every own-token hosted bridge (one Discord client each) and
  * every instance bot bridge (one shared Discord client), reconciled every 60 s.
+ * With worker isolation each own-token bridge runs in its own thread under a
+ * heap limit; instance bot bridges share one login and stay on the main thread.
  * Neither kind imports history; no importer or scheduler is built for them.
  */
 export async function runHost(opts: {
@@ -177,9 +178,11 @@ export async function runHost(opts: {
   dataDir: string
   log: Logger
   version: string
+  hostedIsolation?: HostedIsolation
   fetchImpl?: FetchLike
 }): Promise<Launched> {
   const { log } = opts
+  const isolation = opts.hostedIsolation ?? DEFAULT_HOSTED_ISOLATION
   let stopped = false
   ensureDataDir(opts.dataDir)
 
@@ -222,27 +225,57 @@ export async function runHost(opts: {
     }),
   })
 
+  const createHosted = (entry: HostedEntry): HostedInstance => {
+    const label = `[${entry.bridge_id.slice(0, 8)}]`
+    const dataDir = join(opts.dataDir, 'hosted', safeDirName(entry.bridge_id))
+    const appEmojiDir = join(opts.dataDir, 'app-emojis')
+    if (isolation.mode === 'inline') {
+      return new V2Bridge({
+        label,
+        harmonyToken: entry.harmony_token,
+        apiBase: endpoints.apiBase,
+        gatewayUrl: endpoints.gatewayUrl,
+        baseUrl: publicUrl,
+        discordToken: entry.discord_token,
+        dataDir,
+        appEmojiDir,
+        log,
+        version: opts.version,
+        authHint: HOSTED_AUTH_HINT,
+        discordTokenHint: HOSTED_DISCORD_TOKEN_HINT,
+        fetchImpl: opts.fetchImpl,
+      })
+    }
+    const workerData: HostedWorkerData = {
+      entry,
+      apiBase: endpoints.apiBase,
+      gatewayUrl: endpoints.gatewayUrl,
+      baseUrl: publicUrl,
+      dataDir,
+      appEmojiDir,
+      logLevel: log.level,
+      version: opts.version,
+      healthIntervalMs: HOSTED_HEALTH_INTERVAL_MS,
+    }
+    return new WorkerHostedInstance({
+      workerUrl: new URL('./hostedWorker.js', import.meta.url),
+      workerData,
+      heapMb: isolation.heapMb,
+      log: log.child(label),
+      healthStaleMs: HOSTED_HEALTH_INTERVAL_MS * 6,
+    })
+  }
+
   const runner = new HostRunner({
     log,
     instance,
     fetchHosted: () => BridgeApi.hosted(endpoints.apiBase, opts.hostSecret, opts.fetchImpl),
-    createInstance: (entry) => new V2Bridge({
-      label: `[${entry.bridge_id.slice(0, 8)}]`,
-      harmonyToken: entry.harmony_token,
-      apiBase: endpoints.apiBase,
-      gatewayUrl: endpoints.gatewayUrl,
-      baseUrl: publicUrl,
-      discordToken: entry.discord_token,
-      dataDir: join(opts.dataDir, 'hosted', safeDirName(entry.bridge_id)),
-      appEmojiDir: join(opts.dataDir, 'app-emojis'),
-      log,
-      version: opts.version,
-      authHint: HOSTED_AUTH_HINT,
-      discordTokenHint: HOSTED_DISCORD_TOKEN_HINT,
-      fetchImpl: opts.fetchImpl,
-    }),
+    createInstance: createHosted,
   })
   log.info(`Host mode: bot-gateway ${endpoints.apiBase}`)
+  log.info(isolation.mode === 'worker'
+    ? `Own-bot bridges run in worker threads, heap limit ${isolation.heapMb} MB each`
+    : 'Own-bot bridges run on the main thread (BRIDGE_HOSTED_ISOLATION=inline)')
   await runner.start()
 
   return {

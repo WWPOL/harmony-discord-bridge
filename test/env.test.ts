@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseImportSettings, planLaunch } from '../src/env.js'
+import { parseHostedIsolation, parseImportSettings, planLaunch } from '../src/env.js'
 
 describe('planLaunch', () => {
   it('explains what to set when nothing is configured', () => {
@@ -44,7 +44,7 @@ describe('planLaunch', () => {
 
   it('runs host mode with HARMONY_URL and BRIDGE_HOST_SECRET', () => {
     expect(planLaunch({ BRIDGE_MODE: 'host', HARMONY_URL: 'http://bot-gateway:3002', BRIDGE_HOST_SECRET: 's', HARMONY_PUBLIC_URL: 'https://h.example', HEALTH_PORT: 'off' }, null))
-      .toEqual({ kind: 'host', harmonyUrl: 'http://bot-gateway:3002', hostSecret: 's', publicUrl: 'https://h.example', healthPort: null })
+      .toEqual({ kind: 'host', harmonyUrl: 'http://bot-gateway:3002', hostSecret: 's', publicUrl: 'https://h.example', healthPort: null, hostedIsolation: { mode: 'worker', heapMb: 256 } })
     const missing = planLaunch({ BRIDGE_MODE: 'host', HARMONY_URL: 'https://h.example' }, null)
     expect(missing.kind).toBe('error')
     if (missing.kind === 'error') expect(missing.message).toContain('BRIDGE_HOST_SECRET')
@@ -78,5 +78,27 @@ describe('parseImportSettings', () => {
       expect(res.ok).toBe(false)
       if (!res.ok) expect(res.message).toContain(Object.keys(env)[0])
     }
+  })
+})
+
+describe('parseHostedIsolation', () => {
+  it('defaults to one worker per own-bot bridge with a 256 MB heap', () => {
+    expect(parseHostedIsolation({})).toEqual({ mode: 'worker', heapMb: 256 })
+  })
+
+  it('reads the mode and heap limit', () => {
+    expect(parseHostedIsolation({ BRIDGE_HOSTED_ISOLATION: 'Inline', BRIDGE_HOSTED_HEAP_MB: '512' })).toEqual({ mode: 'inline', heapMb: 512 })
+  })
+
+  it('refuses an unknown mode and a heap limit that is not a whole number of at least 64 MB', () => {
+    expect(parseHostedIsolation({ BRIDGE_HOSTED_ISOLATION: 'process' })).toContain('BRIDGE_HOSTED_ISOLATION')
+    for (const raw of ['32', '1.5', '256mb', '-1']) {
+      expect(parseHostedIsolation({ BRIDGE_HOSTED_HEAP_MB: raw })).toContain('BRIDGE_HOSTED_HEAP_MB')
+    }
+  })
+
+  it('makes an invalid value a host-mode launch error', () => {
+    const plan = planLaunch({ BRIDGE_MODE: 'host', HARMONY_URL: 'https://h.example', BRIDGE_HOST_SECRET: 's', BRIDGE_HOSTED_HEAP_MB: '8' }, null)
+    expect(plan).toMatchObject({ kind: 'error' })
   })
 })
