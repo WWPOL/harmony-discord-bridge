@@ -3,6 +3,7 @@ import { EventEmitter } from 'events'
 import { Backoff, fetchWithRetry, type FetchLike, type RetryOptions } from './http.js'
 import { Logger, errorText } from './log.js'
 import type { PresenceDelta } from './runtime/presenceDeltas.js'
+import type { HarmonyProfileState, ProfilePatchBody } from './runtime/profileSync.js'
 
 interface HarmonyMessage {
   id: string
@@ -46,6 +47,7 @@ export const CAPABILITY = {
   stickerSync: 'bridge_sticker_sync',
   historyImport: 'bridge_history_import',
   privacy: 'bridge_privacy',
+  profileSync: 'bridge_profile_sync',
 } as const
 
 /** A relay Harmony's AutoMod refused (403 `{code: "AUTOMOD_BLOCKED"}`); final, not retried. */
@@ -862,6 +864,19 @@ export class HarmonyClient extends EventEmitter {
       await this.request(`/servers/${serverId}/stickers/${stickerId}`, { method: 'DELETE' }),
       'Failed to delete sticker',
     )
+  }
+
+  /** What the bridge last copied to the server profile, for `/bridge sync-profile`. */
+  async getServerProfileSyncState(serverId: string): Promise<HarmonyProfileState> {
+    return this.getJson<HarmonyProfileState>(`/servers/${serverId}/profile/discord`, 'Failed to fetch server profile state')
+  }
+
+  /** Copies the name, description, icon and banner (by Discord hash) onto the Harmony server. */
+  async syncServerProfile(
+    serverId: string,
+    body: ProfilePatchBody & { invoker_discord_id: string },
+  ): Promise<{ changed: boolean; name: string; description: string | null; icon: string | null; banner: string | null }> {
+    return this.sendJson('PATCH', `/servers/${serverId}/profile/discord`, body, 'Failed to sync server profile')
   }
 
   async getServerSounds(serverId: string): Promise<HarmonyServerSound[]> {

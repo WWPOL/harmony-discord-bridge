@@ -124,7 +124,7 @@ const prompt = (t: { editReply: { mock: { calls: any[][] } } }) => t.editReply.m
 
 describe('/bridge import-history', () => {
   it('is registered for v2 only, and only where import is available', () => {
-    const features = { soundSync: false, emojiSync: false, stickerSync: false, historyImport: true, privacy: false }
+    const features = { soundSync: false, emojiSync: false, stickerSync: false, profileSync: false, historyImport: true, privacy: false }
     const subs = (m: 'v1' | 'v2', f = features) => buildCommands(m, f).find(c => c.name === 'bridge')!.options!.map((o: any) => o.name)
     expect(subs('v2')).toContain('import-history')
     expect(subs('v1')).not.toContain('import-history')

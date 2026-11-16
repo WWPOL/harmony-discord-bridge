@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { buildCommands, NO_FEATURES, type CommandFeatures } from '../src/runtime/commands.js'
 
-const ALL: CommandFeatures = { soundSync: true, emojiSync: true, stickerSync: true, historyImport: true, privacy: true }
+const ALL: CommandFeatures = { soundSync: true, emojiSync: true, stickerSync: true, profileSync: true, historyImport: true, privacy: true }
 const bridgeSubcommands = (mode: 'v1' | 'v2', features: CommandFeatures = ALL) =>
   (buildCommands(mode, features).find(c => c.name === 'bridge')!.options ?? []).map(o => o.name)
 const subcommand = (name: string): any =>
@@ -29,6 +29,7 @@ describe('buildCommands', () => {
     ['sync-sounds', 'soundSync'],
     ['sync-emojis', 'emojiSync'],
     ['sync-stickers', 'stickerSync'],
+    ['sync-profile', 'profileSync'],
     ['import-history', 'historyImport'],
   ] as const)('offers /bridge %s only with its gateway feature', (name, feature) => {
     expect(bridgeSubcommands('v2', { ...NO_FEATURES, [feature]: true })).toContain(name)

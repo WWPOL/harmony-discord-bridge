@@ -882,6 +882,7 @@ export class BridgeRuntime {
       soundSync: has(CAPABILITY.soundSync),
       emojiSync: has(CAPABILITY.emojiSync),
       stickerSync: has(CAPABILITY.stickerSync),
+      profileSync: has(CAPABILITY.profileSync),
       historyImport: has(CAPABILITY.historyImport) && !!this.hooks.importApi && this.hooks.importEnabled?.() === true,
       privacy: has(CAPABILITY.privacy) && !!this.hooks.privacyApi,
     }
